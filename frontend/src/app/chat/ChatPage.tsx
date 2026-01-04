@@ -4,7 +4,7 @@ import React, { useState, useEffect, useRef } from 'react'
 type ReactMouseEvent = React.MouseEvent
 type ReactFormEvent = React.FormEvent<HTMLFormElement>
 type ReactChangeEvent = React.ChangeEvent<HTMLInputElement>
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import { useChatStore, type Message } from '@/state/useChatStore'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
@@ -38,6 +38,7 @@ interface ChatStats {
 export default function ChatPage() {
   const { sessionId } = useParams()
   const navigate = useNavigate()
+  const location = useLocation()
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
@@ -45,6 +46,8 @@ export default function ChatPage() {
   const [stats, setStats] = useState<ChatStats | null>(null)
   const [loadingStats, setLoadingStats] = useState(false)
   const streamRef = useRef<ReturnType<typeof createAgentStream> | null>(null)
+  const initialMessageSentRef = useRef(false)
+  const initialMessageRef = useRef<string | null>(null)
 
   const {
     sessions,
@@ -65,14 +68,55 @@ export default function ChatPage() {
     loadSessions()
   }, [loadSessions])
 
+  // Store initial message from location state when component mounts or sessionId changes
+  useEffect(() => {
+    // Reset refs when sessionId changes
+    initialMessageSentRef.current = false
+    initialMessageRef.current = null
+    
+    const state = location.state as { initialMessage?: string } | null
+    if (state?.initialMessage) {
+      initialMessageRef.current = state.initialMessage
+      // Clear the location state immediately to prevent re-triggering
+      window.history.replaceState({ ...window.history.state, state: null }, '')
+    }
+  }, [sessionId])
+
   useEffect(() => {
     if (sessionId) {
       loadSession(Number(sessionId))
       loadChatStats(Number(sessionId))
+      initialMessageSentRef.current = false
     } else {
       clearCurrentSession()
     }
   }, [sessionId, loadSession, clearCurrentSession])
+
+  // Handle initial message from navigation state - only once when session is loaded
+  useEffect(() => {
+    if (
+      initialMessageRef.current &&
+      currentSession &&
+      messages.length === 0 &&
+      !initialMessageSentRef.current &&
+      !sending
+    ) {
+      const initialMessage = initialMessageRef.current
+      initialMessageSentRef.current = true
+      
+      // Auto-send the initial message after a short delay to ensure session is ready
+      const timeoutId = setTimeout(() => {
+        handleSendWithMessage(initialMessage)
+        // Clear the ref after sending
+        initialMessageRef.current = null
+      }, 500)
+      
+      return () => {
+        clearTimeout(timeoutId)
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSession?.id, messages.length, sending])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -108,11 +152,10 @@ export default function ChatPage() {
     navigate(`/chat/${id}`)
   }
 
-  const handleSend = async () => {
-    if (!input.trim() || sending || !currentSession) return
+  const handleSendWithMessage = async (messageContent: string) => {
+    if (!messageContent.trim() || sending || !currentSession) return
 
-    const content = input.trim()
-    setInput('')
+    const content = messageContent.trim()
     setSending(true)
 
     // Add user message immediately
@@ -196,6 +239,13 @@ export default function ChatPage() {
       }))
       setSending(false)
     }
+  }
+
+  const handleSend = async () => {
+    if (!input.trim()) return
+    const content = input.trim()
+    setInput('')
+    await handleSendWithMessage(content)
   }
 
   // Cleanup stream on unmount

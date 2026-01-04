@@ -22,6 +22,9 @@ export default function Layout() {
           <div className="flex gap-4 items-center">
             {isAuthenticated ? (
               <>
+                <Link to="/dashboard">
+                  <Button variant="ghost">Dashboard</Button>
+                </Link>
                 <Link to="/profile">
                   <Button variant="ghost">Profile</Button>
                 </Link>

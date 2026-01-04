@@ -120,6 +120,27 @@ export default function ProfilePage() {
     <div className="max-w-4xl mx-auto space-y-6">
       <h1 className="text-3xl font-bold">Profile</h1>
 
+      {/* Token Usage Section */}
+      {stats && (
+        <div className="border rounded-lg p-6">
+          <h2 className="text-xl font-semibold mb-4">Token Usage</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <label className="text-sm font-medium text-muted-foreground">Total Tokens</label>
+              <p className="text-2xl font-bold">{stats.total_tokens.toLocaleString()}</p>
+            </div>
+            <div>
+              <label className="text-sm font-medium text-muted-foreground">This Month</label>
+              <p className="text-2xl font-bold">{stats.tokens_this_month.toLocaleString()}</p>
+            </div>
+            <div>
+              <label className="text-sm font-medium text-muted-foreground">Last 30 Days</label>
+              <p className="text-2xl font-bold">{stats.tokens_last_30_days.toLocaleString()}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Basic Information Section */}
       <div className="border rounded-lg p-6">
         <h2 className="text-xl font-semibold mb-4">Basic Information</h2>
@@ -230,27 +251,6 @@ export default function ProfilePage() {
           </Button>
         </div>
       </div>
-
-      {/* Token Usage Section */}
-      {stats && (
-        <div className="border rounded-lg p-6">
-          <h2 className="text-xl font-semibold mb-4">Token Usage</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div>
-              <label className="text-sm font-medium text-muted-foreground">Total Tokens</label>
-              <p className="text-2xl font-bold">{stats.total_tokens.toLocaleString()}</p>
-            </div>
-            <div>
-              <label className="text-sm font-medium text-muted-foreground">This Month</label>
-              <p className="text-2xl font-bold">{stats.tokens_this_month.toLocaleString()}</p>
-            </div>
-            <div>
-              <label className="text-sm font-medium text-muted-foreground">Last 30 Days</label>
-              <p className="text-2xl font-bold">{stats.tokens_last_30_days.toLocaleString()}</p>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
