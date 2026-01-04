@@ -3,8 +3,9 @@
  */
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
+import type { StateCreator } from 'zustand'
 import { authAPI } from '@/lib/api'
-import { setAuthTokens, clearAuthTokens, isAuthenticated } from '@/lib/auth'
+import { setAuthTokens, clearAuthTokens } from '@/lib/auth'
 
 interface User {
   id: number
@@ -16,14 +17,14 @@ interface AuthState {
   user: User | null
   isAuthenticated: boolean
   login: (email: string, password: string) => Promise<void>
-  signup: (email: string, password: string) => Promise<void>
+  signup: (email: string, password: string, first_name?: string, last_name?: string) => Promise<void>
   logout: () => Promise<void>
   setUser: (user: User | null) => void
 }
 
-export const useAuthStore = create<AuthState>()(
+export const useAuthStore = create<AuthState>(
   persist(
-    (set) => ({
+    ((set: (partial: AuthState | Partial<AuthState> | ((state: AuthState) => AuthState | Partial<AuthState>)) => void) => ({
       user: null,
       isAuthenticated: false,
 
@@ -63,7 +64,7 @@ export const useAuthStore = create<AuthState>()(
       setUser: (user: User | null) => {
         set({ user, isAuthenticated: !!user })
       },
-    }),
+    })),
     {
       name: 'auth-storage',
       storage: createJSONStorage(() => localStorage),

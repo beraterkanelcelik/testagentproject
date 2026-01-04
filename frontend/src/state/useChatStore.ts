@@ -2,9 +2,10 @@
  * Chat store using Zustand for managing chat state.
  */
 import { create } from 'zustand'
+import type { StateCreator } from 'zustand'
 import { chatAPI } from '@/lib/api'
 
-interface ChatSession {
+export interface ChatSession {
   id: number
   title: string
   tokens_used: number
@@ -12,12 +13,16 @@ interface ChatSession {
   updated_at: string
 }
 
-interface Message {
+export interface Message {
   id: number
   role: 'user' | 'assistant' | 'system'
   content: string
   tokens_used: number
   created_at: string
+  metadata?: {
+    agent_name?: string
+    tool_calls?: any[]
+  }
 }
 
 interface ChatState {
@@ -35,9 +40,10 @@ interface ChatState {
   sendMessage: (sessionId: number, content: string) => Promise<void>
   deleteSession: (sessionId: number) => Promise<void>
   clearCurrentSession: () => void
+  set: (state: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void
 }
 
-export const useChatStore = create<ChatState>((set, get) => ({
+export const useChatStore = create<ChatState>((set: (partial: ChatState | Partial<ChatState> | ((state: ChatState) => ChatState | Partial<ChatState>)) => void, get: () => ChatState) => ({
   sessions: [],
   currentSession: null,
   messages: [],
@@ -59,7 +65,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const response = await chatAPI.createSession({ title })
       const newSession = response.data
-      set((state) => ({
+      set((state: ChatState) => ({
         sessions: [newSession, ...state.sessions],
         currentSession: newSession,
         loading: false,
@@ -94,7 +100,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   sendMessage: async (sessionId: number, content: string) => {
     try {
-      const response = await chatAPI.sendMessage(sessionId, content)
+      await chatAPI.sendMessage(sessionId, content)
       // Reload messages to get the new ones
       await get().loadMessages(sessionId)
     } catch (error: any) {
@@ -106,8 +112,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   deleteSession: async (sessionId: number) => {
     try {
       await chatAPI.deleteSession(sessionId)
-      set((state) => ({
-        sessions: state.sessions.filter((s) => s.id !== sessionId),
+      set((state: ChatState) => ({
+        sessions: state.sessions.filter((s: ChatSession) => s.id !== sessionId),
         currentSession: state.currentSession?.id === sessionId ? null : state.currentSession,
         messages: state.currentSession?.id === sessionId ? [] : state.messages,
       }))
@@ -118,5 +124,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   clearCurrentSession: () => {
     set({ currentSession: null, messages: [] })
+  },
+
+  set: (updater: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => {
+    if (typeof updater === 'function') {
+      set(updater)
+    } else {
+      set(updater)
+    }
   },
 }))

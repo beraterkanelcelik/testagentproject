@@ -13,6 +13,7 @@ from app.services.chat_service import (
     delete_session,
     add_message,
     get_messages,
+    get_session_stats,
 )
 
 
@@ -128,13 +129,14 @@ def chat_messages(request, session_id):
                 'content': msg.content,
                 'tokens_used': msg.tokens_used,
                 'created_at': msg.created_at.isoformat(),
+                'metadata': msg.metadata or {},
             }
             for msg in messages
         ]
         return JsonResponse({'messages': messages_data})
     
     elif request.method == 'POST':
-        # Send message (placeholder response for now)
+        # Send message and get agent response
         try:
             data = json.loads(request.body)
             content = data.get('content', '').strip()
@@ -145,15 +147,26 @@ def chat_messages(request, session_id):
                     status=400
                 )
             
-            # Add user message
-            user_message = add_message(session_id, 'user', content)
+            # Add user message first
+            user_message = add_message(session_id, 'user', content, tokens_used=0)
             
-            # Add placeholder assistant response (no AI yet)
-            assistant_message = add_message(
-                session_id,
-                'assistant',
-                'This is a placeholder response. AI agent functionality will be implemented in a later phase.'
+            # Execute agent (nodes will save assistant message with tokens)
+            from app.agents.runner import execute_agent
+            
+            result = execute_agent(
+                user_id=user.id,
+                chat_session_id=session_id,
+                message=content
             )
+            
+            # Get the assistant message that was saved by the node
+            from app.db.models.message import Message
+            assistant_messages = Message.objects.filter(
+                session_id=session_id,
+                role='assistant'
+            ).order_by('-created_at')[:1]
+            
+            assistant_message = assistant_messages[0] if assistant_messages else None
             
             return JsonResponse({
                 'message': 'Message sent successfully',
@@ -164,14 +177,46 @@ def chat_messages(request, session_id):
                     'created_at': user_message.created_at.isoformat(),
                 },
                 'assistant_message': {
-                    'id': assistant_message.id,
-                    'role': assistant_message.role,
-                    'content': assistant_message.content,
-                    'created_at': assistant_message.created_at.isoformat(),
+                    'id': assistant_message.id if assistant_message else None,
+                    'role': assistant_message.role if assistant_message else 'assistant',
+                    'content': assistant_message.content if assistant_message else result.get("response", ""),
+                    'tokens_used': assistant_message.tokens_used if assistant_message else 0,
+                    'created_at': assistant_message.created_at.isoformat() if assistant_message else None,
                 },
+                'agent': result.get("agent"),
+                'tool_calls': result.get("tool_calls", []),
             }, status=201)
         
         except json.JSONDecodeError:
             return JsonResponse({'error': 'Invalid JSON'}, status=400)
         except Exception as e:
             return JsonResponse({'error': str(e)}, status=500)
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def chat_session_stats(request, session_id):
+    """Get statistics for a chat session."""
+    user = get_current_user(request)
+    if not user:
+        return JsonResponse(
+            {'error': 'Authentication required'},
+            status=401
+        )
+    
+    # Verify session belongs to user
+    session = get_session(user.id, session_id)
+    if not session:
+        return JsonResponse(
+            {'error': 'Chat session not found'},
+            status=404
+        )
+    
+    stats = get_session_stats(session_id)
+    if not stats:
+        return JsonResponse(
+            {'error': 'Failed to get session statistics'},
+            status=500
+        )
+    
+    return JsonResponse(stats)

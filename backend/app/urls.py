@@ -29,6 +29,7 @@ urlpatterns = [
     path('api/chats/', chats.chat_sessions, name='chat_sessions'),
     path('api/chats/<int:session_id>/', chats.chat_session_detail, name='chat_session'),
     path('api/chats/<int:session_id>/messages/', chats.chat_messages, name='chat_messages'),
+    path('api/chats/<int:session_id>/stats/', chats.chat_session_stats, name='chat_session_stats'),
     
     # Documents
     path('api/documents/', documents.documents, name='documents'),
@@ -36,5 +37,5 @@ urlpatterns = [
     
     # Agent
     path('api/agent/run/', agent.run_agent, name='run_agent'),
-    path('api/agent/stream/<str:run_id>/', agent.stream_agent, name='stream_agent'),
+    path('api/agent/stream/', agent.stream_agent, name='stream_agent'),
 ]

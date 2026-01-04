@@ -1,7 +1,10 @@
-import { useState } from 'react'
+import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/state/useAuthStore'
 import { Button } from '@/components/ui/button'
+
+type ReactFormEvent = React.FormEvent<HTMLFormElement>
+type ReactChangeEvent = React.ChangeEvent<HTMLInputElement>
 
 export default function LoginPage() {
   const [email, setEmail] = useState('')
@@ -11,7 +14,7 @@ export default function LoginPage() {
   const { login } = useAuthStore()
   const navigate = useNavigate()
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: ReactFormEvent) => {
     e.preventDefault()
     setError('')
     setLoading(true)
@@ -41,7 +44,7 @@ export default function LoginPage() {
           <input
             type="email"
             value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            onChange={(e: ReactChangeEvent) => setEmail(e.target.value)}
             className="w-full px-3 py-2 border rounded-md"
             required
           />
@@ -51,7 +54,7 @@ export default function LoginPage() {
           <input
             type="password"
             value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            onChange={(e: ReactChangeEvent) => setPassword(e.target.value)}
             className="w-full px-3 py-2 border rounded-md"
             required
           />

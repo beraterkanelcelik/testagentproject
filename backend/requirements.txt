@@ -2,12 +2,15 @@
 Django>=5.0.0
 
 # PostgreSQL adapter
-psycopg2-binary>=2.9.9
+psycopg2-binary>=2.9.9  # For Django
+psycopg[binary]>=3.1.0  # For langgraph-checkpoint-postgres
 
 # Core LangChain dependencies
 langchain>=0.1.0
 langchain-core>=0.1.0
+langchain-openai>=0.1.0
 langgraph>=0.0.40
+langgraph-checkpoint-postgres>=2.0.0
 
 # LangSmith for tracing and observability
 langsmith>=0.0.80

@@ -1,7 +1,9 @@
-import { useState, useEffect } from 'react'
+import React, { useState, useEffect } from 'react'
 import { userAPI, authAPI } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
+
+type ReactChangeEvent = React.ChangeEvent<HTMLInputElement>
 
 interface UserProfile {
   id: number
@@ -160,7 +162,7 @@ export default function ProfilePage() {
               <input
                 type="text"
                 value={firstName}
-                onChange={(e) => setFirstName(e.target.value)}
+                onChange={(e: ReactChangeEvent) => setFirstName(e.target.value)}
                 className="w-full px-3 py-2 border rounded-md"
               />
             </div>
@@ -169,7 +171,7 @@ export default function ProfilePage() {
               <input
                 type="text"
                 value={lastName}
-                onChange={(e) => setLastName(e.target.value)}
+                onChange={(e: ReactChangeEvent) => setLastName(e.target.value)}
                 className="w-full px-3 py-2 border rounded-md"
               />
             </div>
@@ -198,7 +200,7 @@ export default function ProfilePage() {
             <input
               type="password"
               value={oldPassword}
-              onChange={(e) => setOldPassword(e.target.value)}
+              onChange={(e: ReactChangeEvent) => setOldPassword(e.target.value)}
               className="w-full px-3 py-2 border rounded-md"
             />
           </div>
@@ -207,7 +209,7 @@ export default function ProfilePage() {
             <input
               type="password"
               value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
+              onChange={(e: ReactChangeEvent) => setNewPassword(e.target.value)}
               className="w-full px-3 py-2 border rounded-md"
               minLength={8}
             />
@@ -218,7 +220,7 @@ export default function ProfilePage() {
             <input
               type="password"
               value={confirmPassword}
-              onChange={(e) => setConfirmPassword(e.target.value)}
+              onChange={(e: ReactChangeEvent) => setConfirmPassword(e.target.value)}
               className="w-full px-3 py-2 border rounded-md"
               minLength={8}
             />
