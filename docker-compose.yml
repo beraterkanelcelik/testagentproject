@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  ai-agents-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-agents-chat
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      # Mount code for development (hot reload)
+      - .:/app
+      # Exclude node_modules and other unnecessary files
+      - /app/__pycache__
+      - /app/.streamlit
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
