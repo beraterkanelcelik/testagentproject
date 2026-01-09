@@ -132,86 +132,60 @@ def get_messages(session_id):
 
 def get_session_stats(session_id: int) -> Dict[str, Any]:
     """
-    Get statistics for a chat session.
+    Get statistics for a chat session using Langfuse Metrics API.
+    
+    Message counts are retrieved from database, while token usage, costs,
+    and agent/tool analytics come from Langfuse Metrics API v2.
     
     Args:
         session_id: Session ID
         
     Returns:
         Dictionary with session statistics
+        
+    Raises:
+        ValueError: If Langfuse metrics are unavailable
+        ChatSession.DoesNotExist: If session not found
     """
-    try:
-        from app.core.pricing import calculate_cost
-        
-        session = ChatSession.objects.get(id=session_id)
-        messages = Message.objects.filter(session_id=session_id)
-        
-        # Count messages by role
-        user_messages = messages.filter(role='user').count()
-        assistant_messages = messages.filter(role='assistant').count()
-        total_messages = messages.count()
-        
-        # Calculate token usage breakdown
-        total_tokens = session.tokens_used
-        message_tokens = sum(msg.tokens_used for msg in messages)
-        
-        # Aggregate I/O tokens from messages
-        total_input_tokens = 0
-        total_output_tokens = 0
-        total_cached_tokens = 0
-        
-        for msg in messages:
-            metadata = msg.metadata or {}
-            total_input_tokens += metadata.get('input_tokens', 0)
-            total_output_tokens += metadata.get('output_tokens', 0)
-            total_cached_tokens += metadata.get('cached_tokens', 0)
-        
-        # Calculate cost
-        model_name = session.model_used
-        cost_info = calculate_cost(
-            input_tokens=total_input_tokens,
-            output_tokens=total_output_tokens,
-            cached_tokens=total_cached_tokens,
-            model_name=model_name
-        )
-        
-        # Agent usage statistics
-        agent_usage = {}
-        tool_usage = {}
-        
-        for msg in messages.filter(role='assistant'):
-            metadata = msg.metadata or {}
-            agent_name = metadata.get('agent_name', 'unknown')
-            agent_usage[agent_name] = agent_usage.get(agent_name, 0) + 1
-            
-            # Count tool calls
-            tool_calls = metadata.get('tool_calls', [])
-            for tool_call in tool_calls:
-                tool_name = tool_call.get('tool', 'unknown') if isinstance(tool_call, dict) else 'unknown'
-                tool_usage[tool_name] = tool_usage.get(tool_name, 0) + 1
-        
-        return {
-            'session_id': session_id,
-            'title': session.title,
-            'created_at': session.created_at.isoformat(),
-            'updated_at': session.updated_at.isoformat(),
-            'total_messages': total_messages,
-            'user_messages': user_messages,
-            'assistant_messages': assistant_messages,
-            'total_tokens': total_tokens,
-            'message_tokens': message_tokens,
-            'input_tokens': total_input_tokens,
-            'output_tokens': total_output_tokens,
-            'cached_tokens': total_cached_tokens,
-            'model_used': session.model_used,
-            'cost': {
-                'total': float(cost_info['total_cost']),
-                'input': float(cost_info['input_cost']),
-                'output': float(cost_info['output_cost']),
-                'cached': float(cost_info['cached_cost']),
-            },
-            'agent_usage': agent_usage,
-            'tool_usage': tool_usage,
-        }
-    except ChatSession.DoesNotExist:
-        return None
+    from app.services.langfuse_metrics import get_session_metrics_from_langfuse
+    
+    # 1. Get session from database (for metadata)
+    session = ChatSession.objects.get(id=session_id)
+    
+    # 2. Get message counts from database (simpler, more reliable)
+    messages = Message.objects.filter(session_id=session_id)
+    user_messages = messages.filter(role='user').count()
+    assistant_messages = messages.filter(role='assistant').count()
+    total_messages = messages.count()
+    
+    # 3. Query Langfuse Metrics API
+    langfuse_metrics = get_session_metrics_from_langfuse(session_id)
+    if not langfuse_metrics:
+        raise ValueError("Langfuse metrics unavailable. Ensure Langfuse is enabled and session has traces.")
+    
+    # 4. Combine database + Langfuse data
+    return {
+        'session_id': session_id,
+        'title': session.title,
+        'created_at': session.created_at.isoformat(),
+        'updated_at': session.updated_at.isoformat(),
+        'total_messages': total_messages,
+        'user_messages': user_messages,
+        'assistant_messages': assistant_messages,
+        # From Langfuse Metrics API:
+        'total_tokens': langfuse_metrics.get('total_tokens', 0),
+        'message_tokens': langfuse_metrics.get('total_tokens', 0),  # Use total_tokens as message_tokens
+        'input_tokens': langfuse_metrics.get('input_tokens', 0),
+        'output_tokens': langfuse_metrics.get('output_tokens', 0),
+        'cached_tokens': langfuse_metrics.get('cached_tokens', 0),
+        'model_used': session.model_used,
+        'cost': langfuse_metrics.get('cost', {
+            'total': 0.0,
+            'input': 0.0,
+            'output': 0.0,
+            'cached': 0.0,
+        }),
+        'agent_usage': langfuse_metrics.get('agent_usage', {}),
+        'tool_usage': langfuse_metrics.get('tool_usage', {}),
+        'activity_timeline': langfuse_metrics.get('activity_timeline', []),  # User-friendly activity log
+    }

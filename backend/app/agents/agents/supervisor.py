@@ -1,7 +1,7 @@
 """
 Supervisor agent for routing messages to appropriate sub-agents.
 """
-from typing import List, Dict, Any
+from typing import List
 from langchain_core.messages import BaseMessage, AIMessage
 from app.agents.agents.base import BaseAgent
 from app.core.logging import get_logger
@@ -14,11 +14,10 @@ class SupervisorAgent(BaseAgent):
     Supervisor agent that routes user messages to appropriate sub-agents.
     """
     
-    # Available agents
+    # Available agents - can be moved to config or registry in future
     AVAILABLE_AGENTS = {
         "greeter": "Provides welcome messages and guidance. Use when user needs help or is starting.",
         "gmail": "Handles email-related tasks. Use when user asks about emails, messages, or mail.",
-        # Future agents can be added here
     }
     
     def __init__(self):
@@ -49,19 +48,21 @@ Consider:
 
 Respond with ONLY the agent name (e.g., "greeter" or "gmail"). Do not include any other text."""
     
-    def route_message(self, messages: List[BaseMessage]) -> str:
+    def route_message(self, messages: List[BaseMessage], **kwargs) -> str:
         """
         Route message to appropriate agent.
         
         Args:
             messages: Conversation messages
+            **kwargs: Additional arguments including config (callbacks, run_id, metadata)
             
         Returns:
             Agent name to route to
         """
         try:
             # Get routing decision from LLM
-            response = self.invoke(messages)
+            # Pass through config (including callbacks) from LangGraph
+            response = self.invoke(messages, **kwargs)
             
             # Extract agent name from response
             agent_name = response.content.strip().lower()

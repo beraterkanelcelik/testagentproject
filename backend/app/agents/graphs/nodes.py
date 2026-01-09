@@ -1,14 +1,15 @@
 """
 Graph node implementations.
 """
-from typing import Dict, Any, Iterator
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from typing import Dict, Any
+from langchain_core.messages import AIMessage
 from app.agents.graphs.state import AgentState
 from app.agents.agents.supervisor import SupervisorAgent
 from app.agents.agents.greeter import GreeterAgent
 from app.agents.tools.registry import tool_registry
 from app.db.models.message import Message as MessageModel
 from app.db.models.session import ChatSession
+from app.agents.config import OPENAI_MODEL
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -40,12 +41,13 @@ def supervisor_node(state: AgentState) -> AgentState:
     return state
 
 
-def greeter_node(state: AgentState) -> AgentState:
+def greeter_node(state: AgentState, config: dict = None) -> AgentState:
     """
     Greeter node - executes greeter agent.
     
     Args:
         state: Current graph state
+        config: Optional runtime config (contains callbacks from graph.invoke())
         
     Returns:
         Updated state with greeter response
@@ -58,9 +60,11 @@ def greeter_node(state: AgentState) -> AgentState:
     state["current_agent"] = "greeter"
     
     try:
-        logger.debug("Executing greeter node")
-        # Get greeter response
-        response = greeter_agent.invoke(messages)
+        # Pass config to agent.invoke() so callbacks propagate to LLM calls
+        invoke_kwargs = {}
+        if config:
+            invoke_kwargs['config'] = config
+        response = greeter_agent.invoke(messages, **invoke_kwargs)
         
         # Extract token usage from response if available
         tokens_used = 0
@@ -68,19 +72,25 @@ def greeter_node(state: AgentState) -> AgentState:
         output_tokens = 0
         cached_tokens = 0
         
-        if hasattr(response, 'response_metadata') and response.response_metadata:
+        # Check usage_metadata first (OpenAI streaming format)
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            usage = response.usage_metadata
+            tokens_used = usage.get('total_tokens', 0)
+            input_tokens = usage.get('input_tokens', 0)
+            output_tokens = usage.get('output_tokens', 0)
+            cached_tokens = usage.get('cached_tokens', 0) or usage.get('cached_input_tokens', 0) or usage.get('cache_creation_input_tokens', 0)
+            state["metadata"]["token_usage"] = usage
+            logger.debug(f"Token usage: {tokens_used} total (input: {input_tokens}, output: {output_tokens}, cached: {cached_tokens})")
+        # Fallback to response_metadata.token_usage
+        elif hasattr(response, 'response_metadata') and response.response_metadata:
             usage = response.response_metadata.get('token_usage', {})
             if usage:
                 tokens_used = usage.get('total_tokens', 0)
-                input_tokens = usage.get('prompt_tokens', 0)
-                output_tokens = usage.get('completion_tokens', 0)
+                input_tokens = usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0)
+                output_tokens = usage.get('completion_tokens', 0) or usage.get('output_tokens', 0)
                 cached_tokens = usage.get('cached_tokens', 0)
                 state["metadata"]["token_usage"] = usage
-                logger.info(f"Token usage extracted from greeter response: {tokens_used} total tokens (input: {input_tokens}, output: {output_tokens}, cached: {cached_tokens})")
-            else:
-                logger.warning("response_metadata exists but token_usage is missing")
-        else:
-            logger.warning(f"Response metadata not available. Has response_metadata: {hasattr(response, 'response_metadata')}, response_metadata value: {getattr(response, 'response_metadata', None)}")
+                logger.debug(f"Token usage: {tokens_used} total (input: {input_tokens}, output: {output_tokens}, cached: {cached_tokens})")
         
         # Add response to messages
         if isinstance(response, AIMessage):
@@ -90,11 +100,15 @@ def greeter_node(state: AgentState) -> AgentState:
             state["messages"].append(AIMessage(content=str(response.content)))
         
         # Save message to database if chat_session_id exists
+        # Skip saving in streaming mode - streaming function handles saving after all tokens are accumulated
+        metadata = state.get("metadata", {})
+        execution_type = metadata.get("execution_type", "")
+        is_streaming = execution_type == "streaming"
+        
         chat_session_id = state.get("chat_session_id")
-        if chat_session_id:
+        if chat_session_id and not is_streaming:
             try:
                 session = ChatSession.objects.get(id=chat_session_id)
-                from app.agents.config import OPENAI_MODEL
                 
                 # Update model_used if not set
                 if not session.model_used:
@@ -139,13 +153,13 @@ def greeter_node(state: AgentState) -> AgentState:
     return state
 
 
-def agent_node(state: AgentState) -> AgentState:
+def agent_node(state: AgentState, config: dict = None) -> AgentState:
     """
     Generic agent node - executes the agent specified in next_agent.
-    For now, this is a placeholder for future agents.
     
     Args:
         state: Current graph state
+        config: Optional runtime config (contains callbacks from graph.invoke())
         
     Returns:
         Updated state
@@ -158,77 +172,110 @@ def agent_node(state: AgentState) -> AgentState:
     
     state["current_agent"] = next_agent_name
     
-    # For now, route unknown agents to greeter
-    # In future, we can have specific agent implementations here
-    if next_agent_name == "gmail":
-        # Placeholder for Gmail agent (to be implemented)
-        response = AIMessage(
-            content="Gmail agent is not yet implemented. This feature will be available soon."
-        )
-        tokens_used = 0
-    else:
-        # Default to greeter
-        response = greeter_agent.invoke(messages)
+    try:
+        # Pass config to agent.invoke() so callbacks propagate to LLM calls
+        invoke_kwargs = {}
+        if config:
+            invoke_kwargs['config'] = config
+        
+        # Route to specific agent based on supervisor's decision
+        if next_agent_name == "gmail":
+            # Placeholder for Gmail agent (to be implemented)
+            response = AIMessage(
+                content="Gmail agent is not yet implemented. This feature will be available soon."
+            )
+            tokens_used = 0
+            input_tokens = 0
+            output_tokens = 0
+            cached_tokens = 0
+        elif next_agent_name == "greeter":
+            # Greeter agent
+            response = greeter_agent.invoke(messages, **invoke_kwargs)
+            
+            # Extract token usage from response if available
+            tokens_used = 0
+            input_tokens = 0
+            output_tokens = 0
+            cached_tokens = 0
+            
+            # Check usage_metadata first (OpenAI streaming format)
+            if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                usage = response.usage_metadata
+                tokens_used = usage.get('total_tokens', 0)
+                input_tokens = usage.get('input_tokens', 0)
+                output_tokens = usage.get('output_tokens', 0)
+                cached_tokens = usage.get('cached_tokens', 0) or usage.get('cached_input_tokens', 0) or usage.get('cache_creation_input_tokens', 0)
+                state["metadata"]["token_usage"] = usage
+                logger.debug(f"Token usage: {tokens_used} total (input: {input_tokens}, output: {output_tokens}, cached: {cached_tokens})")
+            # Fallback to response_metadata.token_usage
+            elif hasattr(response, 'response_metadata') and response.response_metadata:
+                usage = response.response_metadata.get('token_usage', {})
+                if usage:
+                    tokens_used = usage.get('total_tokens', 0)
+                    input_tokens = usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0)
+                    output_tokens = usage.get('completion_tokens', 0) or usage.get('output_tokens', 0)
+                    cached_tokens = usage.get('cached_tokens', 0)
+                    state["metadata"]["token_usage"] = usage
+                    logger.debug(f"Token usage: {tokens_used} total (input: {input_tokens}, output: {output_tokens}, cached: {cached_tokens})")
+        else:
+            # Unknown agent - this should not happen if supervisor is working correctly
+            logger.error(f"Unknown agent '{next_agent_name}' - supervisor should only route to available agents")
+            raise ValueError(f"Agent '{next_agent_name}' is not implemented. Supervisor routed to invalid agent.")
+        
         if not isinstance(response, AIMessage):
             response = AIMessage(content=str(response.content))
         
-        # Extract token usage from response if available
-        tokens_used = 0
-        input_tokens = 0
-        output_tokens = 0
-        cached_tokens = 0
+        state["messages"].append(response)
         
-        if hasattr(response, 'response_metadata') and response.response_metadata:
-            usage = response.response_metadata.get('token_usage', {})
-            if usage:
-                tokens_used = usage.get('total_tokens', 0)
-                input_tokens = usage.get('prompt_tokens', 0)
-                output_tokens = usage.get('completion_tokens', 0)
-                cached_tokens = usage.get('cached_tokens', 0)
-                state["metadata"]["token_usage"] = usage
-    
-    state["messages"].append(response)
-    
-    # Save to database
-    chat_session_id = state.get("chat_session_id")
-    if chat_session_id:
-        try:
-            session = ChatSession.objects.get(id=chat_session_id)
-            from app.agents.config import OPENAI_MODEL
-            
-            # Update model_used if not set
-            if not session.model_used:
-                session.model_used = OPENAI_MODEL
-            
-            message_obj = MessageModel.objects.create(
-                session=session,
-                role="assistant",
-                content=response.content if hasattr(response, 'content') else str(response),
-                tokens_used=tokens_used,
-                metadata={
-                    "agent_name": next_agent_name,
-                    "tool_calls": state.get("tool_calls", []),
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "cached_tokens": cached_tokens,
-                    "model": OPENAI_MODEL,
-                }
-            )
-            
-            # Update session and user token usage
-            if tokens_used > 0:
-                session.tokens_used += tokens_used
-                session.save(update_fields=['tokens_used', 'model_used'])
+        # Save to database
+        # Skip saving in streaming mode - streaming function handles saving after all tokens are accumulated
+        metadata = state.get("metadata", {})
+        execution_type = metadata.get("execution_type", "")
+        is_streaming = execution_type == "streaming"
+        
+        chat_session_id = state.get("chat_session_id")
+        if chat_session_id and not is_streaming:
+            try:
+                session = ChatSession.objects.get(id=chat_session_id)
                 
-                user = session.user
-                user.token_usage_count += tokens_used
-                user.save(update_fields=['token_usage_count'])
-            
-            logger.debug(f"Saved agent message to database for session {chat_session_id}, tokens: {tokens_used}")
-        except ChatSession.DoesNotExist:
-            logger.warning(f"Chat session {chat_session_id} not found when saving message")
-        except Exception as e:
-            logger.error(f"Error saving agent message to database: {e}", exc_info=True)
+                # Update model_used if not set
+                if not session.model_used:
+                    session.model_used = OPENAI_MODEL
+                
+                message_obj = MessageModel.objects.create(
+                    session=session,
+                    role="assistant",
+                    content=response.content if hasattr(response, 'content') else str(response),
+                    tokens_used=tokens_used,
+                    metadata={
+                        "agent_name": next_agent_name,
+                        "tool_calls": state.get("tool_calls", []),
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cached_tokens": cached_tokens,
+                        "model": OPENAI_MODEL,
+                    }
+                )
+                
+                # Update session and user token usage
+                if tokens_used > 0:
+                    session.tokens_used += tokens_used
+                    session.save(update_fields=['tokens_used', 'model_used'])
+                    
+                    user = session.user
+                    user.token_usage_count += tokens_used
+                    user.save(update_fields=['token_usage_count'])
+                
+                logger.debug(f"Saved agent message to database for session {chat_session_id}, tokens: {tokens_used}")
+            except ChatSession.DoesNotExist:
+                logger.warning(f"Chat session {chat_session_id} not found when saving message")
+            except Exception as e:
+                logger.error(f"Error saving agent message to database: {e}", exc_info=True)
+        
+    except Exception as e:
+        logger.error(f"Error in agent node: {e}", exc_info=True)
+        error_msg = AIMessage(content=f"I apologize, but I encountered an error: {str(e)}")
+        state["messages"].append(error_msg)
     
     return state
 

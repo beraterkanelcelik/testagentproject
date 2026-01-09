@@ -1,0 +1,46 @@
+# Langfuse Python SDK Usage Rules
+
+## Always Use Latest Langfuse Python SDK v3
+
+When implementing Langfuse tracing or observability features:
+
+1. **Always reference the official Python SDK documentation:**
+   - Primary reference: https://python.reference.langfuse.com/langfuse
+   - Use the latest SDK patterns and APIs from this documentation
+
+2. **SDK Version:**
+   - Always use `langfuse>=3.0.0` (v3 SDK with OpenTelemetry)
+   - The SDK was rewritten in v3 and released in June 2025
+
+3. **Key Imports:**
+   - `from langfuse import get_client, Langfuse`
+   - `from langfuse.langchain import CallbackHandler`
+
+4. **Configuration:**
+   - Use `LANGFUSE_BASE_URL` (preferred) or `LANGFUSE_HOST` (deprecated but supported)
+   - Environment variables: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL`
+   - The SDK automatically reads from environment variables
+
+5. **Client Initialization:**
+   - Use `get_client()` for singleton pattern (recommended)
+   - Or `Langfuse()` constructor with explicit parameters
+   - Client uses OpenTelemetry under the hood
+
+6. **Flushing Traces:**
+   - Always call `client.flush()` after operations to ensure traces are sent immediately
+   - The SDK batches traces by default (flush_at=512, flush_interval=5s)
+
+7. **CallbackHandler:**
+   - Automatically uses environment variables
+   - No constructor arguments needed in v3
+   - Pass trace context via metadata: `langfuse_trace_id`, `langfuse_user_id`, `langfuse_session_id`
+
+8. **Trace Creation:**
+   - Use `client.start_as_current_observation()` for context managers
+   - Use `client.start_observation()` for manual span management
+   - Trace IDs must be 32-character lowercase hex strings (use `Langfuse.create_trace_id()`)
+
+9. **When in doubt:**
+   - Check the official documentation first: https://python.reference.langfuse.com/langfuse
+   - Follow the examples and patterns from the official docs
+   - The SDK documentation is the source of truth

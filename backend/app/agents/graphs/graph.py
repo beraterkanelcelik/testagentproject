@@ -50,7 +50,7 @@ def create_agent_graph(checkpoint_saver: BaseCheckpointSaver = None) -> StateGra
     graph.add_edge("agent", END)
     
     # Add conditional edge from tool (can route back to agent or end)
-    graph.add_edge("tool", END)  # For now, tool execution ends the flow
+    graph.add_edge("tool", END)
     
     # Compile with checkpoint if provided
     if checkpoint_saver:

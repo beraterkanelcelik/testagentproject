@@ -9,7 +9,39 @@ import { useChatStore, type Message } from '@/state/useChatStore'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
 import { createAgentStream, StreamEvent } from '@/lib/streaming'
-import { chatAPI } from '@/lib/api'
+import { chatAPI, agentAPI } from '@/lib/api'
+
+interface ActivityTimelineItem {
+  id: string | null
+  trace_id?: string | null
+  type: string
+  category: 'llm_call' | 'tool_call' | 'event' | 'other'
+  name: string
+  agent?: string
+  tool?: string
+  tools?: Array<{ name: string; input?: any }>
+  timestamp: string | null
+  latency_ms: number | null
+  tokens?: {
+    input: number
+    output: number
+    total: number
+  }
+  cost?: number
+  model?: string
+  input_preview?: string
+  output_preview?: string
+  message?: string
+}
+
+interface ActivityChain {
+  trace_id: string
+  activities: ActivityTimelineItem[]
+  total_tokens: number
+  total_cost: number
+  first_timestamp: string | null
+  agents: string[]
+}
 
 interface ChatStats {
   session_id: number
@@ -33,6 +65,7 @@ interface ChatStats {
   }
   agent_usage: Record<string, number>
   tool_usage: Record<string, number>
+  activity_timeline?: ActivityTimelineItem[]
 }
 
 export default function ChatPage() {
@@ -45,6 +78,11 @@ export default function ChatPage() {
   const [activeTab, setActiveTab] = useState<'chat' | 'stats'>('chat')
   const [stats, setStats] = useState<ChatStats | null>(null)
   const [loadingStats, setLoadingStats] = useState(false)
+  const [useStreaming, setUseStreaming] = useState(true) // Toggle for streaming vs non-streaming
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
+  const [sessionToDelete, setSessionToDelete] = useState<number | null>(null)
+  const [expandedActivities, setExpandedActivities] = useState<string[]>([])
+  const [expandedChains, setExpandedChains] = useState<string[]>([])
   const streamRef = useRef<ReturnType<typeof createAgentStream> | null>(null)
   const initialMessageSentRef = useRef(false)
   const initialMessageRef = useRef<string | null>(null)
@@ -85,12 +123,18 @@ export default function ChatPage() {
   useEffect(() => {
     if (sessionId) {
       loadSession(Number(sessionId))
-      loadChatStats(Number(sessionId))
       initialMessageSentRef.current = false
     } else {
       clearCurrentSession()
     }
   }, [sessionId, loadSession, clearCurrentSession])
+
+  // Load stats only after session is loaded and when on stats tab
+  useEffect(() => {
+    if (currentSession && activeTab === 'stats') {
+      loadChatStats(currentSession.id)
+    }
+  }, [currentSession?.id, activeTab])
 
   // Handle initial message from navigation state - only once when session is loaded
   useEffect(() => {
@@ -123,11 +167,11 @@ export default function ChatPage() {
   }, [messages])
 
   useEffect(() => {
-    // Refresh stats when messages change
-    if (currentSession && activeTab === 'stats') {
+    // Refresh stats when messages change and we're on stats tab
+    if (currentSession && activeTab === 'stats' && messages.length > 0) {
       loadChatStats(currentSession.id)
     }
-  }, [messages, currentSession, activeTab])
+  }, [messages.length, currentSession?.id, activeTab])
 
   const loadChatStats = async (sessionId: number) => {
     setLoadingStats(true)
@@ -135,7 +179,11 @@ export default function ChatPage() {
       const response = await chatAPI.getStats(sessionId)
       setStats(response.data)
     } catch (error: any) {
-      console.error('Failed to load stats:', error)
+      // Silently fail for new chats with no messages - stats will be available after first message
+      if (error.response?.status !== 404 && error.response?.status !== 422) {
+        console.error('Failed to load stats:', error)
+      }
+      setStats(null)
     } finally {
       setLoadingStats(false)
     }
@@ -170,73 +218,82 @@ export default function ChatPage() {
       messages: [...state.messages, userMessage],
     }))
 
-    // Create streaming message placeholder
-    const assistantMessageId = Date.now() + 1
-    set((state: { messages: Message[] }) => ({
-      messages: [
-        ...state.messages,
-        {
-          id: assistantMessageId,
-          role: 'assistant' as const,
-          content: '',
-          tokens_used: 0,
-          created_at: new Date().toISOString(),
-          metadata: { agent_name: 'greeter' },
-        },
-      ],
-    }))
-
     try {
       const token = localStorage.getItem('access_token')
       if (!token) {
         throw new Error('No authentication token')
       }
 
-      // Use streaming
-      const stream = createAgentStream(
-        currentSession.id,
-        content,
-        token,
-        (event: StreamEvent) => {
-          if (event.type === 'token') {
-            // Update the assistant message in store by appending the new token
-            set((state: { messages: Message[] }) => {
-              const currentMessage = state.messages.find((msg: Message) => msg.id === assistantMessageId)
-              const currentContent = currentMessage?.content || ''
-              const newContent = currentContent + event.data
-              
-              return {
-                messages: state.messages.map((msg: Message) =>
-                  msg.id === assistantMessageId
-                    ? { ...msg, content: newContent }
-                    : msg
-                ),
-              }
-            })
-          } else if (event.type === 'error') {
-            toast.error(event.data?.error || 'Streaming error occurred')
+      if (useStreaming) {
+        // Create streaming message placeholder
+        const assistantMessageId = Date.now() + 1
+        set((state: { messages: Message[] }) => ({
+          messages: [
+            ...state.messages,
+            {
+              id: assistantMessageId,
+              role: 'assistant' as const,
+              content: '',
+              tokens_used: 0,
+              created_at: new Date().toISOString(),
+              metadata: { agent_name: 'greeter' },
+            },
+          ],
+        }))
+
+        // Use streaming
+        const stream = createAgentStream(
+          currentSession.id,
+          content,
+          token,
+          (event: StreamEvent) => {
+            if (event.type === 'token') {
+              // Update the assistant message in store by appending the new token
+              set((state: { messages: Message[] }) => {
+                const currentMessage = state.messages.find((msg: Message) => msg.id === assistantMessageId)
+                const currentContent = currentMessage?.content || ''
+                const newContent = currentContent + event.data
+                
+                return {
+                  messages: state.messages.map((msg: Message) =>
+                    msg.id === assistantMessageId
+                      ? { ...msg, content: newContent }
+                      : msg
+                  ),
+                }
+              })
+            } else if (event.type === 'error') {
+              toast.error(event.data?.error || 'Streaming error occurred')
+              setSending(false)
+            }
+          },
+          (error: Error) => {
+            toast.error(error.message || 'Streaming connection error')
+            setSending(false)
+          },
+          () => {
+            // Stream complete, reload messages to get final saved version
+            loadMessages(currentSession.id)
+            loadChatStats(currentSession.id)
             setSending(false)
           }
-        },
-        (error: Error) => {
-          toast.error(error.message || 'Streaming connection error')
-          setSending(false)
-        },
-        () => {
-          // Stream complete, reload messages to get final saved version
-          loadMessages(currentSession.id)
-          loadChatStats(currentSession.id)
-          setSending(false)
-        }
-      )
+        )
 
-      streamRef.current = stream
+        streamRef.current = stream
+      } else {
+        // Use non-streaming (regular API call via agent.runAgent)
+        // No placeholder needed - response comes back immediately
+        const response = await agentAPI.runAgent({
+          chat_session_id: currentSession.id,
+          message: content,
+        })
+        // Reload messages to get both user and assistant messages from backend
+        loadMessages(currentSession.id)
+        loadChatStats(currentSession.id)
+        setSending(false)
+      }
     } catch (error: any) {
-      toast.error(error.message || 'Failed to send message')
-      // Remove the placeholder assistant message on error
-      set((state: { messages: Message[] }) => ({
-        messages: state.messages.filter((msg: Message) => msg.id !== assistantMessageId),
-      }))
+      toast.error(error.response?.data?.error || error.message || 'Failed to send message')
       setSending(false)
     }
   }
@@ -259,12 +316,24 @@ export default function ChatPage() {
 
   const handleDeleteSession = async (id: number, e: ReactMouseEvent) => {
     e.stopPropagation()
-    if (confirm('Are you sure you want to delete this chat session?')) {
-      await deleteSession(id)
-      if (currentSession?.id === id) {
-        navigate('/chat')
-      }
+    setSessionToDelete(id)
+    setDeleteDialogOpen(true)
+  }
+
+  const confirmDeleteSession = async () => {
+    if (sessionToDelete === null) return
+    
+    await deleteSession(sessionToDelete)
+    if (currentSession?.id === sessionToDelete) {
+      navigate('/chat')
     }
+    setDeleteDialogOpen(false)
+    setSessionToDelete(null)
+  }
+
+  const cancelDeleteSession = () => {
+    setDeleteDialogOpen(false)
+    setSessionToDelete(null)
   }
 
   const getAgentName = (msg: Message): string => {
@@ -277,6 +346,7 @@ export default function ChatPage() {
   }
 
   return (
+    <>
     <div className="flex h-[calc(100vh-200px)]">
       {/* Sidebar */}
       <div className="w-64 border-r flex flex-col">
@@ -403,11 +473,6 @@ export default function ChatPage() {
                               }`}
                             >
                               <p className="whitespace-pre-wrap">{msg.content}</p>
-                              {msg.tokens_used > 0 && (
-                                <p className="text-xs opacity-70 mt-2">
-                                  {msg.tokens_used} tokens
-                                </p>
-                              )}
                             </div>
                           </div>
                         </div>
@@ -424,6 +489,21 @@ export default function ChatPage() {
                       {error}
                     </div>
                   )}
+                  {/* Streaming Toggle */}
+                  <div className="mb-2 flex items-center gap-2">
+                    <label className="flex items-center gap-2 text-sm cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={useStreaming}
+                        onChange={(e) => setUseStreaming(e.target.checked)}
+                        className="w-4 h-4"
+                        disabled={sending}
+                      />
+                      <span className={useStreaming ? 'text-primary' : 'text-muted-foreground'}>
+                        Streaming {useStreaming ? '(ON)' : '(OFF)'}
+                      </span>
+                    </label>
+                  </div>
                   <form
                     onSubmit={(e: ReactFormEvent) => {
                       e.preventDefault()
@@ -572,6 +652,263 @@ export default function ChatPage() {
                         </div>
                       </div>
                     </div>
+
+                    {/* Activity Timeline */}
+                    <div className="border rounded-lg p-4">
+                      <h3 className="font-semibold mb-4">Activity Timeline</h3>
+                      {stats.activity_timeline && stats.activity_timeline.length > 0 ? (() => {
+                        // Group activities by trace_id (message chains)
+                        const chainsMap = new Map<string, ActivityChain>()
+                        
+                        stats.activity_timeline.forEach((activity, index) => {
+                          const traceId = activity.trace_id || `no-trace-${index}`
+                          
+                          if (!chainsMap.has(traceId)) {
+                            chainsMap.set(traceId, {
+                              trace_id: traceId,
+                              activities: [],
+                              total_tokens: 0,
+                              total_cost: 0,
+                              first_timestamp: activity.timestamp,
+                              agents: []
+                            })
+                          }
+                          
+                          const chain = chainsMap.get(traceId)!
+                          chain.activities.push(activity)
+                          
+                          if (activity.tokens) {
+                            chain.total_tokens += activity.tokens.total
+                          }
+                          if (activity.cost) {
+                            chain.total_cost += activity.cost
+                          }
+                          if (activity.agent && !chain.agents.includes(activity.agent)) {
+                            chain.agents.push(activity.agent)
+                          }
+                          if (activity.timestamp && (!chain.first_timestamp || activity.timestamp < chain.first_timestamp)) {
+                            chain.first_timestamp = activity.timestamp
+                          }
+                        })
+                        
+                        const chains = Array.from(chainsMap.values()).sort((a, b) => {
+                          if (!a.first_timestamp || !b.first_timestamp) return 0
+                          return a.first_timestamp.localeCompare(b.first_timestamp)
+                        })
+                        
+                        return (
+                          <div className="space-y-4">
+                            {chains.map((chain) => {
+                              // Expand chains by default (if not explicitly collapsed)
+                              // If expandedChains is empty, all chains are expanded by default
+                              // If a chain ID is in expandedChains, it means user clicked to collapse it
+                              const isChainExpanded = !expandedChains.includes(chain.trace_id)
+                              
+                              return (
+                                <div key={chain.trace_id} className="border rounded-lg p-3 bg-muted/20">
+                                  {/* Chain Header - Collapsible */}
+                                  <div 
+                                    className="flex items-start justify-between cursor-pointer hover:bg-muted/50 rounded p-2 -m-2"
+                                    onClick={() => {
+                                      setExpandedChains(prev => 
+                                        prev.includes(chain.trace_id) 
+                                          ? prev.filter(id => id !== chain.trace_id) // Remove from collapsed list (expand it)
+                                          : [...prev, chain.trace_id] // Add to collapsed list
+                                      )
+                                    }}
+                                  >
+                                    <div className="flex-1">
+                                      <div className="flex items-center gap-2">
+                                        <svg
+                                          className={`w-4 h-4 text-muted-foreground transition-transform ${isChainExpanded ? 'rotate-90' : ''}`}
+                                          fill="none"
+                                          stroke="currentColor"
+                                          viewBox="0 0 24 24"
+                                        >
+                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                        </svg>
+                                        <span className="font-semibold">Message Chain</span>
+                                        {chain.agents.length > 0 && (
+                                          <div className="flex gap-1">
+                                            {chain.agents.map(agent => (
+                                              <span key={agent} className="text-xs px-2 py-0.5 rounded bg-primary/10 text-primary">
+                                                {agent}
+                                              </span>
+                                            ))}
+                                          </div>
+                                        )}
+                                        <span className="text-xs text-muted-foreground">
+                                          {chain.activities.length} {chain.activities.length === 1 ? 'activity' : 'activities'}
+                                        </span>
+                                      </div>
+                                      {chain.first_timestamp && (
+                                        <div className="text-xs text-muted-foreground mt-1 ml-6">
+                                          {new Date(chain.first_timestamp).toLocaleString()}
+                                        </div>
+                                      )}
+                                    </div>
+                                    
+                                    {/* Chain Summary */}
+                                    <div className="text-right text-sm">
+                                      <div className="text-muted-foreground">
+                                        {chain.total_tokens || 0} tokens
+                                      </div>
+                                      {(chain.total_cost || 0) > 0 && (
+                                        <div className="text-muted-foreground">
+                                          ${chain.total_cost.toFixed(6)}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  {/* Chain Activities - Collapsible */}
+                                  {isChainExpanded && (
+                                    <div className="mt-3 space-y-3 pl-6 border-l-2 border-muted">
+                                      {chain.activities.map((activity, activityIndex) => {
+                                        const activityKey = `${chain.trace_id}-${activity.id || String(activityIndex)}`
+                                        const isExpanded = expandedActivities.includes(activityKey)
+                                        const hasDetails = !!(activity.model || activity.tools?.length || activity.input_preview || activity.output_preview || activity.message)
+                                        
+                                        return (
+                                          <div key={activity.id || activityIndex} className="relative">
+                                            {/* Timeline dot */}
+                                            <div className="absolute -left-3 top-0 w-3 h-3 rounded-full bg-primary/70 border-2 border-background"></div>
+                                            
+                                            <div className="space-y-2">
+                                              {/* Activity Header - Clickable if has details */}
+                                              <div 
+                                                className={`flex items-start justify-between ${hasDetails ? 'cursor-pointer hover:bg-muted/50 rounded p-2 -m-2' : ''}`}
+                                                onClick={() => {
+                                                  if (hasDetails) {
+                                                    setExpandedActivities(prev => 
+                                                      prev.includes(activityKey) 
+                                                        ? prev.filter(key => key !== activityKey)
+                                                        : [...prev, activityKey]
+                                                    )
+                                                  }
+                                                }}
+                                              >
+                                                <div className="flex-1">
+                                                  <div className="flex items-center gap-2">
+                                                    {hasDetails && (
+                                                      <svg
+                                                        className={`w-4 h-4 text-muted-foreground transition-transform ${isExpanded ? 'rotate-90' : ''}`}
+                                                        fill="none"
+                                                        stroke="currentColor"
+                                                        viewBox="0 0 24 24"
+                                                      >
+                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                                                      </svg>
+                                                    )}
+                                                    <span className="font-medium text-sm">{activity.name}</span>
+                                                    {activity.agent && (
+                                                      <span className="text-xs px-2 py-0.5 rounded bg-primary/10 text-primary">
+                                                        {activity.agent}
+                                                      </span>
+                                                    )}
+                                                    {activity.tool && (
+                                                      <span className="text-xs px-2 py-0.5 rounded bg-secondary text-secondary-foreground">
+                                                        {activity.tool}
+                                                      </span>
+                                                    )}
+                                                    <span className="text-xs text-muted-foreground capitalize">
+                                                      {activity.category.replace('_', ' ')}
+                                                    </span>
+                                                  </div>
+                                                  {activity.timestamp && (
+                                                    <div className="text-xs text-muted-foreground mt-1 ml-6">
+                                                      {new Date(activity.timestamp).toLocaleString()}
+                                                      {activity.latency_ms && (
+                                                        <span className="ml-2">• {activity.latency_ms.toFixed(0)}ms</span>
+                                                      )}
+                                                    </div>
+                                                  )}
+                                                </div>
+                                                
+                                                {/* Tokens and Cost */}
+                                                <div className="text-right text-sm">
+                                                  {activity.tokens && (
+                                                    <div className="text-muted-foreground">
+                                                      {activity.tokens.total} tokens
+                                                    </div>
+                                                  )}
+                                                  {activity.cost && (
+                                                    <div className="text-muted-foreground">
+                                                      ${activity.cost.toFixed(6)}
+                                                    </div>
+                                                  )}
+                                                </div>
+                                              </div>
+
+                                              {/* Collapsible Details */}
+                                              {isExpanded && hasDetails && (
+                                                <div className="mt-2 space-y-2 pl-6">
+                                                  {/* Model info */}
+                                                  {activity.model && (
+                                                    <div className="text-xs text-muted-foreground">
+                                                      Model: {activity.model}
+                                                    </div>
+                                                  )}
+
+                                                  {/* Tool calls */}
+                                                  {activity.tools && activity.tools.length > 0 && (
+                                                    <div className="mt-2 space-y-1">
+                                                      {activity.tools.map((tool, toolIndex) => (
+                                                        <div key={toolIndex} className="text-sm bg-muted/50 p-2 rounded">
+                                                          <span className="font-mono text-xs">{tool.name}</span>
+                                                          {tool.input && (
+                                                            <div className="text-xs text-muted-foreground mt-1 break-words">
+                                                              {typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input).substring(0, 200)}
+                                                            </div>
+                                                          )}
+                                                        </div>
+                                                      ))}
+                                                    </div>
+                                                  )}
+
+                                                  {/* Input/Output previews */}
+                                                  {(activity.input_preview || activity.output_preview) && (
+                                                    <div className="mt-2 space-y-1 text-sm">
+                                                      {activity.input_preview && (
+                                                        <div className="bg-muted/30 p-2 rounded">
+                                                          <div className="text-xs text-muted-foreground mb-1">Input:</div>
+                                                          <div className="text-xs font-mono break-words">{activity.input_preview}</div>
+                                                        </div>
+                                                      )}
+                                                      {activity.output_preview && (
+                                                        <div className="bg-muted/30 p-2 rounded">
+                                                          <div className="text-xs text-muted-foreground mb-1">Output:</div>
+                                                          <div className="text-xs font-mono break-words">{activity.output_preview}</div>
+                                                        </div>
+                                                      )}
+                                                    </div>
+                                                  )}
+
+                                                  {/* Event message */}
+                                                  {activity.message && (
+                                                    <div className="text-sm text-muted-foreground italic">
+                                                      {activity.message}
+                                                    </div>
+                                                  )}
+                                                </div>
+                                              )}
+                                            </div>
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+                                  )}
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )
+                      })() : (
+                        <div className="text-center text-muted-foreground py-8">
+                          No activity timeline data available
+                        </div>
+                      )}
+                    </div>
                   </div>
                 ) : (
                   <div className="text-center text-muted-foreground py-8">
@@ -584,5 +921,26 @@ export default function ChatPage() {
         )}
       </div>
     </div>
+
+    {/* Delete Confirmation Dialog */}
+    {deleteDialogOpen && (
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={cancelDeleteSession}>
+        <div className="bg-background border rounded-lg p-6 max-w-md w-full mx-4 shadow-lg" onClick={(e) => e.stopPropagation()}>
+          <h3 className="text-lg font-semibold mb-2">Delete Chat Session</h3>
+          <p className="text-muted-foreground mb-6">
+            Are you sure you want to delete this chat session? This action cannot be undone.
+          </p>
+          <div className="flex justify-end gap-3">
+            <Button variant="outline" onClick={cancelDeleteSession}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={confirmDeleteSession}>
+              Delete
+            </Button>
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   )
 }

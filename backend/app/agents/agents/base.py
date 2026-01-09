@@ -2,17 +2,22 @@
 Base agent class for all agents.
 """
 from abc import ABC, abstractmethod
-from typing import List, Optional, Dict, Any, Iterator
+from typing import List, Iterator
 import os
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage, AIMessage
 from langchain_core.tools import BaseTool
-from app.agents.config import OPENAI_API_KEY, OPENAI_MODEL, LANGCHAIN_TRACING_V2, LANGCHAIN_PROJECT
+from app.agents.config import (
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+    LANGCHAIN_TRACING_V2,
+    LANGCHAIN_PROJECT,
+)
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Enable LangSmith tracing if configured
+# Enable LangSmith tracing if configured (optional, for compatibility)
 if LANGCHAIN_TRACING_V2:
     os.environ['LANGCHAIN_TRACING_V2'] = 'true'
     os.environ['LANGCHAIN_PROJECT'] = LANGCHAIN_PROJECT
@@ -36,6 +41,9 @@ class BaseAgent(ABC):
         """
         self.name = name
         self.description = description
+        
+        # LLM initialization - callbacks are passed via config at invocation time
+        # This allows LangGraph to handle callback propagation automatically
         self.llm = ChatOpenAI(
             model=OPENAI_MODEL,
             temperature=temperature,
@@ -62,13 +70,14 @@ class BaseAgent(ABC):
         
         Args:
             messages: List of conversation messages
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments including config (callbacks, run_id, metadata)
             
         Returns:
             AI response message
         """
         try:
             logger.debug(f"Invoking {self.name} agent with {len(messages)} messages")
+            
             # Add system prompt as first message if not present
             system_prompt = self.get_system_prompt()
             if system_prompt:
@@ -87,8 +96,13 @@ class BaseAgent(ABC):
             else:
                 llm_with_tools = self.llm
             
-            # Invoke LLM
-            response = llm_with_tools.invoke(messages)
+            # Invoke LLM - pass through config from kwargs
+            # LangGraph handles callback propagation automatically
+            invoke_kwargs = {}
+            if 'config' in kwargs:
+                invoke_kwargs['config'] = kwargs['config']
+            
+            response = llm_with_tools.invoke(messages, **invoke_kwargs)
             logger.debug(f"{self.name} agent response generated successfully")
             return response
         except Exception as e:
@@ -101,7 +115,7 @@ class BaseAgent(ABC):
         
         Args:
             messages: List of conversation messages
-            **kwargs: Additional arguments
+            **kwargs: Additional arguments including config (callbacks, run_id, metadata)
             
         Yields:
             Streaming message chunks
@@ -121,6 +135,11 @@ class BaseAgent(ABC):
         else:
             llm_with_tools = self.llm
         
-        # Stream response
-        for chunk in llm_with_tools.stream(messages):
+        # Stream response - pass through config from kwargs
+        # LangGraph handles callback propagation automatically
+        stream_kwargs = {}
+        if 'config' in kwargs:
+            stream_kwargs['config'] = kwargs['config']
+        
+        for chunk in llm_with_tools.stream(messages, **stream_kwargs):
             yield chunk

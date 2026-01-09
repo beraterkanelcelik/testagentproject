@@ -64,6 +64,15 @@ def run_agent(request):
         run_id = str(uuid.uuid4())
         logger.info(f"Running agent for user {user.id}, session {chat_session_id}, run_id {run_id}")
         
+        # Save user message first
+        from app.services.chat_service import add_message
+        try:
+            user_message = add_message(chat_session_id, 'user', message)
+            logger.debug(f"Saved user message {user_message.id} before agent execution")
+        except Exception as e:
+            logger.error(f"Error saving user message: {e}", exc_info=True)
+            return JsonResponse({'error': 'Failed to save user message'}, status=500)
+        
         # Execute agent
         result = execute_agent(
             user_id=user.id,

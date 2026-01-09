@@ -6,6 +6,7 @@ from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
 from app.core.dependencies import get_current_user
+from app.core.logging import get_logger
 from app.services.chat_service import (
     create_session,
     get_user_sessions,
@@ -15,6 +16,8 @@ from app.services.chat_service import (
     get_messages,
     get_session_stats,
 )
+
+logger = get_logger(__name__)
 
 
 @csrf_exempt
@@ -212,11 +215,18 @@ def chat_session_stats(request, session_id):
             status=404
         )
     
-    stats = get_session_stats(session_id)
-    if not stats:
+    try:
+        stats = get_session_stats(session_id)
+        return JsonResponse(stats)
+    except ValueError as e:
+        # Langfuse metrics unavailable
+        return JsonResponse(
+            {'error': str(e)},
+            status=503  # Service Unavailable
+        )
+    except Exception as e:
+        logger.error(f"Error getting session stats: {e}", exc_info=True)
         return JsonResponse(
             {'error': 'Failed to get session statistics'},
             status=500
         )
-    
-    return JsonResponse(stats)
