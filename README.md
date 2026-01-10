@@ -2,6 +2,8 @@
 
 > **A comprehensive, production-ready platform for building, testing, and deploying multi-agent AI systems with full observability, RAG capabilities, and enterprise-grade features.**
 
+> **Note**: Development continues on dev privately.
+
 Agent Playground is a full-stack monorepo that provides everything you need to build sophisticated AI agent applications. Built on industry-leading technologies (LangChain, LangGraph, Langfuse), it offers a complete solution from development to production with real-time observability, cost tracking, and multi-agent orchestration.
 
 ---
