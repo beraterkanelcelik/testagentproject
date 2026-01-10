@@ -77,6 +77,7 @@ export default function ChatPage() {
   const [useStreaming, setUseStreaming] = useState(true) // Toggle for streaming vs non-streaming
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [sessionToDelete, setSessionToDelete] = useState<number | null>(null)
+  const [deleteAllDialogOpen, setDeleteAllDialogOpen] = useState(false)
   const [expandedActivities, setExpandedActivities] = useState<string[]>([])
   const [expandedChains, setExpandedChains] = useState<string[]>([])
   const streamRef = useRef<ReturnType<typeof createAgentStream> | null>(null)
@@ -94,6 +95,7 @@ export default function ChatPage() {
     loadSession,
     loadMessages,
     deleteSession,
+    deleteAllSessions,
     clearCurrentSession,
     set,
   } = useChatStore()
@@ -334,6 +336,25 @@ export default function ChatPage() {
     setSessionToDelete(null)
   }
 
+  const handleDeleteAllSessions = () => {
+    setDeleteAllDialogOpen(true)
+  }
+
+  const confirmDeleteAllSessions = async () => {
+    try {
+      await deleteAllSessions()
+      navigate('/chat')
+      toast.success('All chat sessions deleted successfully')
+      setDeleteAllDialogOpen(false)
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to delete all sessions'))
+    }
+  }
+
+  const cancelDeleteAllSessions = () => {
+    setDeleteAllDialogOpen(false)
+  }
+
   const getAgentName = (msg: Message): string => {
     if (msg.role === 'user') return ''
     return msg.metadata?.agent_name || 'assistant'
@@ -348,10 +369,19 @@ export default function ChatPage() {
     <div className="flex h-[calc(100vh-200px)]">
       {/* Sidebar */}
       <div className="w-64 border-r flex flex-col">
-        <div className="p-4 border-b">
+        <div className="p-4 border-b space-y-2">
           <Button onClick={handleNewChat} className="w-full">
             New Chat
           </Button>
+          {sessions.length > 0 && (
+            <Button 
+              onClick={handleDeleteAllSessions} 
+              variant="destructive" 
+              className="w-full"
+            >
+              Delete All Chats
+            </Button>
+          )}
         </div>
         <div className="flex-1 overflow-y-auto">
           {loading && sessions.length === 0 ? (
@@ -934,6 +964,26 @@ export default function ChatPage() {
             </Button>
             <Button variant="destructive" onClick={confirmDeleteSession}>
               Delete
+            </Button>
+          </div>
+        </div>
+      </div>
+    )}
+
+    {/* Delete All Confirmation Dialog */}
+    {deleteAllDialogOpen && (
+      <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={cancelDeleteAllSessions}>
+        <div className="bg-background border rounded-lg p-6 max-w-md w-full mx-4 shadow-lg" onClick={(e) => e.stopPropagation()}>
+          <h3 className="text-lg font-semibold mb-2">Delete All Chat Sessions</h3>
+          <p className="text-muted-foreground mb-6">
+            Are you sure you want to delete all {sessions.length} chat session{sessions.length !== 1 ? 's' : ''}? This action cannot be undone.
+          </p>
+          <div className="flex justify-end gap-3">
+            <Button variant="outline" onClick={cancelDeleteAllSessions}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={confirmDeleteAllSessions}>
+              Delete All
             </Button>
           </div>
         </div>

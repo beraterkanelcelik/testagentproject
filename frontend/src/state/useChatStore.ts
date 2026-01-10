@@ -40,6 +40,7 @@ interface ChatState {
   loadMessages: (sessionId: number) => Promise<void>
   sendMessage: (sessionId: number, content: string) => Promise<void>
   deleteSession: (sessionId: number) => Promise<void>
+  deleteAllSessions: () => Promise<void>
   clearCurrentSession: () => void
   set: (state: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void
 }
@@ -120,6 +121,20 @@ export const useChatStore = create<ChatState>((set: (partial: ChatState | Partia
       }))
     } catch (error: unknown) {
       set({ error: getErrorMessage(error, 'Failed to delete session') })
+    }
+  },
+
+  deleteAllSessions: async () => {
+    try {
+      await chatAPI.deleteAllSessions()
+      set({
+        sessions: [],
+        currentSession: null,
+        messages: [],
+      })
+    } catch (error: unknown) {
+      set({ error: getErrorMessage(error, 'Failed to delete all sessions') })
+      throw error
     }
   },
 

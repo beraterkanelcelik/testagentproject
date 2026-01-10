@@ -38,7 +38,7 @@ export default function HomePage() {
 
   return (
     <div className="flex flex-col items-center justify-center min-h-[60vh]">
-      <h1 className="text-4xl font-bold mb-4">AI Agent Chat</h1>
+      <h1 className="text-4xl font-bold mb-4">Agent Playground</h1>
       <p className="text-muted-foreground mb-8">
         Chat with AI agents powered by LangChain and LangGraph
       </p>

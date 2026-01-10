@@ -13,7 +13,7 @@ OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
 # LangSmith Configuration (optional, kept for compatibility)
 LANGCHAIN_API_KEY = os.getenv('LANGCHAIN_API_KEY')
 LANGCHAIN_TRACING_V2 = os.getenv('LANGCHAIN_TRACING_V2', 'false').lower() == 'true'
-LANGCHAIN_PROJECT = os.getenv('LANGCHAIN_PROJECT', 'test-agent-project')
+LANGCHAIN_PROJECT = os.getenv('LANGCHAIN_PROJECT', 'agent-playground')
 LANGCHAIN_ENDPOINT = os.getenv('LANGCHAIN_ENDPOINT', 'https://api.smith.langchain.com')
 
 # Langfuse Configuration (primary tracing solution)

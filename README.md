@@ -1,11 +1,11 @@
-# AI Agent Test Website
+# Agent Playground
 
 A monorepo project for building and testing AI agents using Django, LangChain, LangGraph, PostgreSQL with pgvector, and React + Vite frontend.
 
 ## Project Structure
 
 ```
-TestAgentProject/
+Agent-Playground/
 ├─ README.md
 ├─ .gitignore
 ├─ .env.example

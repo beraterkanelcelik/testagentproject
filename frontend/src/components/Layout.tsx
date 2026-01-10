@@ -17,7 +17,7 @@ export default function Layout() {
       <nav className="border-b">
         <div className="container mx-auto px-4 py-4 flex justify-between items-center">
           <Link to="/" className="text-2xl font-bold">
-            AI Agent Chat
+            Agent Playground
           </Link>
           <div className="flex gap-4 items-center">
             {isAuthenticated ? (

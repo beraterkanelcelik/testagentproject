@@ -65,7 +65,7 @@ export default function DashboardPage() {
         <div className="p-6 border rounded-lg">
           <h2 className="text-xl font-semibold mb-2">Start New Chat</h2>
           <p className="text-muted-foreground mb-4">
-            Begin a new conversation with the AI agent
+            Begin a new conversation with the agent
           </p>
           <Button onClick={handleNewChat}>New Chat</Button>
         </div>

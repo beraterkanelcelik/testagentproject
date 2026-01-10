@@ -27,6 +27,7 @@ urlpatterns = [
     
     # Chats
     path('api/chats/', chats.chat_sessions, name='chat_sessions'),
+    path('api/chats/delete-all/', chats.delete_all_chat_sessions, name='delete_all_chat_sessions'),
     path('api/chats/<int:session_id>/', chats.chat_session_detail, name='chat_session'),
     path('api/chats/<int:session_id>/messages/', chats.chat_messages, name='chat_messages'),
     path('api/chats/<int:session_id>/stats/', chats.chat_session_stats, name='chat_session_stats'),

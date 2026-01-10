@@ -12,6 +12,7 @@ from app.services.chat_service import (
     get_user_sessions,
     get_session,
     delete_session,
+    delete_all_sessions,
     add_message,
     get_messages,
     get_session_stats,
@@ -194,6 +195,31 @@ def chat_messages(request, session_id):
             return JsonResponse({'error': 'Invalid JSON'}, status=400)
         except Exception as e:
             return JsonResponse({'error': str(e)}, status=500)
+
+
+@csrf_exempt
+@require_http_methods(["DELETE"])
+def delete_all_chat_sessions(request):
+    """Delete all chat sessions for the current user."""
+    user = get_current_user(request)
+    if not user:
+        return JsonResponse(
+            {'error': 'Authentication required'},
+            status=401
+        )
+    
+    try:
+        deleted_count = delete_all_sessions(user.id)
+        return JsonResponse({
+            'message': f'Deleted {deleted_count} chat session(s) successfully',
+            'deleted_count': deleted_count
+        })
+    except Exception as e:
+        logger.error(f"Error deleting all sessions for user {user.id}: {e}", exc_info=True)
+        return JsonResponse(
+            {'error': 'Failed to delete all sessions'},
+            status=500
+        )
 
 
 @csrf_exempt

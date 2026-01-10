@@ -82,6 +82,22 @@ def delete_session(user_id: int, session_id: int) -> bool:
         return False
 
 
+def delete_all_sessions(user_id: int) -> int:
+    """
+    Delete all chat sessions for a user.
+    
+    Args:
+        user_id: User ID
+        
+    Returns:
+        Number of sessions deleted
+    """
+    deleted_count = ChatSession.objects.filter(user_id=user_id).count()
+    ChatSession.objects.filter(user_id=user_id).delete()
+    logger.debug(f"Deleted {deleted_count} chat sessions for user {user_id}")
+    return deleted_count
+
+
 def add_message(session_id, role, content, tokens_used=0, metadata=None):
     """
     Add a message to a chat session.
