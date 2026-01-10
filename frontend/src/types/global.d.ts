@@ -25,9 +25,12 @@ declare namespace JSX {
 }
 
 declare module 'react' {
-  export const useState: <T>(initial: T) => [T, (value: T) => void]
-  export const useEffect: (fn: () => void | (() => void), deps?: any[]) => void
-  export const useRef: <T>(initial: T) => { current: T }
+  type Dispatch<T> = (value: T | ((prev: T) => T)) => void
+  export function useState<T>(initial: T | (() => T)): [T, Dispatch<T>]
+  export function useEffect(fn: () => void | (() => void), deps?: any[]): void
+  export function useRef<T>(initial: T): { current: T }
+  export function useCallback<T extends (...args: any[]) => any>(fn: T, deps?: any[]): T
+  export function forwardRef<T, P = {}>(render: (props: P, ref: Ref<T>) => ReactElement | null): (props: P & RefAttributes<T>) => ReactElement | null
   export const StrictMode: React.ComponentType<{ children?: React.ReactNode }>
   export const Fragment: React.ComponentType<{ children?: React.ReactNode }>
   export type MouseEvent<T = Element> = React.MouseEvent<T>
@@ -35,10 +38,31 @@ declare module 'react' {
   export type ChangeEvent<T = Element> = React.ChangeEvent<T>
   export type ReactNode = React.ReactNode
   export type ReactElement = React.ReactElement
+  export type Ref<T> = any
+  export type RefAttributes<T> = { ref?: Ref<T> }
+  export interface ButtonHTMLAttributes<T> extends HTMLAttributes<T> {
+    disabled?: boolean
+    form?: string
+    formAction?: string
+    formEncType?: string
+    formMethod?: string
+    formNoValidate?: boolean
+    formTarget?: string
+    name?: string
+    type?: 'button' | 'reset' | 'submit'
+    value?: string | ReadonlyArray<string> | number
+  }
+  export interface HTMLAttributes<T> {
+    className?: string
+    id?: string
+    [key: string]: any
+  }
   const React: {
-    useState: <T>(initial: T) => [T, (value: T) => void]
+    useState: <T>(initial: T | (() => T)) => [T, Dispatch<T>]
     useEffect: (fn: () => void | (() => void), deps?: any[]) => void
     useRef: <T>(initial: T) => { current: T }
+    useCallback: <T extends (...args: any[]) => any>(fn: T, deps?: any[]) => T
+    forwardRef: <T, P = {}>(render: (props: P, ref: Ref<T>) => ReactElement | null) => ((props: P & RefAttributes<T>) => ReactElement | null) & { displayName?: string }
     StrictMode: React.ComponentType<{ children?: React.ReactNode }>
     Fragment: React.ComponentType<{ children?: React.ReactNode }>
   }
@@ -72,7 +96,7 @@ declare module 'react-router-dom' {
     className?: string
   }>
   export const Outlet: React.ComponentType
-  export function useNavigate(): (to: string) => void
+  export function useNavigate(): (to: string | number, options?: { state?: any; replace?: boolean }) => void
   export function useParams(): Record<string, string | undefined>
 }
 

@@ -1,15 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react'
-
-// Type declarations for React event types
-type ReactMouseEvent = React.MouseEvent
-type ReactFormEvent = React.FormEvent<HTMLFormElement>
-type ReactChangeEvent = React.ChangeEvent<HTMLInputElement>
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import { useChatStore, type Message } from '@/state/useChatStore'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
 import { createAgentStream, StreamEvent } from '@/lib/streaming'
 import { chatAPI, agentAPI } from '@/lib/api'
+import { getErrorMessage } from '@/lib/utils'
 
 interface ActivityTimelineItem {
   id: string | null
@@ -19,7 +15,7 @@ interface ActivityTimelineItem {
   name: string
   agent?: string
   tool?: string
-  tools?: Array<{ name: string; input?: any }>
+  tools?: Array<{ name: string; input?: string | Record<string, unknown> }>
   timestamp: string | null
   latency_ms: number | null
   tokens?: {
@@ -129,78 +125,26 @@ export default function ChatPage() {
     }
   }, [sessionId, loadSession, clearCurrentSession])
 
-  // Load stats only after session is loaded and when on stats tab
-  useEffect(() => {
-    if (currentSession && activeTab === 'stats') {
-      loadChatStats(currentSession.id)
-    }
-  }, [currentSession?.id, activeTab])
-
-  // Handle initial message from navigation state - only once when session is loaded
-  useEffect(() => {
-    if (
-      initialMessageRef.current &&
-      currentSession &&
-      messages.length === 0 &&
-      !initialMessageSentRef.current &&
-      !sending
-    ) {
-      const initialMessage = initialMessageRef.current
-      initialMessageSentRef.current = true
-      
-      // Auto-send the initial message after a short delay to ensure session is ready
-      const timeoutId = setTimeout(() => {
-        handleSendWithMessage(initialMessage)
-        // Clear the ref after sending
-        initialMessageRef.current = null
-      }, 500)
-      
-      return () => {
-        clearTimeout(timeoutId)
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentSession?.id, messages.length, sending])
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
-
-  useEffect(() => {
-    // Refresh stats when messages change and we're on stats tab
-    if (currentSession && activeTab === 'stats' && messages.length > 0) {
-      loadChatStats(currentSession.id)
-    }
-  }, [messages.length, currentSession?.id, activeTab])
-
-  const loadChatStats = async (sessionId: number) => {
+  const loadChatStats = useCallback(async (sessionId: number) => {
     setLoadingStats(true)
     try {
       const response = await chatAPI.getStats(sessionId)
       setStats(response.data)
-    } catch (error: any) {
+    } catch (error: unknown) {
       // Silently fail for new chats with no messages - stats will be available after first message
-      if (error.response?.status !== 404 && error.response?.status !== 422) {
-        console.error('Failed to load stats:', error)
+      if (error && typeof error === 'object' && 'response' in error) {
+        const apiError = error as { response?: { status?: number } }
+        if (apiError.response?.status !== 404 && apiError.response?.status !== 422) {
+          // Error is logged but not shown to user for expected failures
+        }
       }
       setStats(null)
     } finally {
       setLoadingStats(false)
     }
-  }
+  }, [])
 
-  const handleNewChat = async () => {
-    const newSession = await createSession()
-    if (newSession) {
-      navigate(`/chat/${newSession.id}`)
-    }
-  }
-
-  const handleSelectSession = (id: number) => {
-    navigate(`/chat/${id}`)
-  }
-
-  const handleSendWithMessage = async (messageContent: string) => {
+  const handleSendWithMessage = useCallback(async (messageContent: string) => {
     if (!messageContent.trim() || sending || !currentSession) return
 
     const content = messageContent.trim()
@@ -292,10 +236,64 @@ export default function ChatPage() {
         loadChatStats(currentSession.id)
         setSending(false)
       }
-    } catch (error: any) {
-      toast.error(error.response?.data?.error || error.message || 'Failed to send message')
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to send message'))
       setSending(false)
     }
+  }, [currentSession, sending, useStreaming, loadMessages, loadChatStats])
+
+  // Load stats only after session is loaded and when on stats tab
+  useEffect(() => {
+    if (currentSession && activeTab === 'stats') {
+      loadChatStats(currentSession.id)
+    }
+  }, [currentSession?.id, activeTab, loadChatStats])
+
+  // Handle initial message from navigation state - only once when session is loaded
+  useEffect(() => {
+    if (
+      initialMessageRef.current &&
+      currentSession &&
+      messages.length === 0 &&
+      !initialMessageSentRef.current &&
+      !sending
+    ) {
+      const initialMessage = initialMessageRef.current
+      initialMessageSentRef.current = true
+      
+      // Auto-send the initial message after a short delay to ensure session is ready
+      const timeoutId = setTimeout(() => {
+        handleSendWithMessage(initialMessage)
+        // Clear the ref after sending
+        initialMessageRef.current = null
+      }, 500)
+      
+      return () => {
+        clearTimeout(timeoutId)
+      }
+    }
+  }, [currentSession?.id, messages.length, sending, handleSendWithMessage])
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  useEffect(() => {
+    // Refresh stats when messages change and we're on stats tab
+    if (currentSession && activeTab === 'stats' && messages.length > 0) {
+      loadChatStats(currentSession.id)
+    }
+  }, [messages.length, currentSession?.id, activeTab, loadChatStats])
+
+  const handleNewChat = async () => {
+    const newSession = await createSession()
+    if (newSession) {
+      navigate(`/chat/${newSession.id}`)
+    }
+  }
+
+  const handleSelectSession = (id: number) => {
+    navigate(`/chat/${id}`)
   }
 
   const handleSend = async () => {
@@ -314,7 +312,7 @@ export default function ChatPage() {
     }
   }, [])
 
-  const handleDeleteSession = async (id: number, e: ReactMouseEvent) => {
+  const handleDeleteSession = async (id: number, e: React.MouseEvent) => {
     e.stopPropagation()
     setSessionToDelete(id)
     setDeleteDialogOpen(true)
@@ -382,7 +380,7 @@ export default function ChatPage() {
                       </p>
                     </div>
                     <button
-                      onClick={(e: ReactMouseEvent) => handleDeleteSession(session.id, e)}
+                      onClick={(e: React.MouseEvent) => handleDeleteSession(session.id, e)}
                       className="ml-2 text-muted-foreground hover:text-destructive"
                       title="Delete session"
                     >
@@ -505,7 +503,7 @@ export default function ChatPage() {
                     </label>
                   </div>
                   <form
-                    onSubmit={(e: ReactFormEvent) => {
+                    onSubmit={(e: React.FormEvent<HTMLFormElement>) => {
                       e.preventDefault()
                       handleSend()
                     }}
@@ -514,7 +512,7 @@ export default function ChatPage() {
                     <input
                       type="text"
                       value={input}
-                      onChange={(e: ReactChangeEvent) => setInput(e.target.value)}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) => setInput(e.target.value)}
                       placeholder="Type your message..."
                       className="flex-1 px-4 py-2 border rounded-md"
                       disabled={sending}
@@ -710,7 +708,7 @@ export default function ChatPage() {
                                   <div 
                                     className="flex items-start justify-between cursor-pointer hover:bg-muted/50 rounded p-2 -m-2"
                                     onClick={() => {
-                                      setExpandedChains(prev => 
+                                      setExpandedChains((prev: string[]) => 
                                         prev.includes(chain.trace_id) 
                                           ? prev.filter(id => id !== chain.trace_id) // Remove from collapsed list (expand it)
                                           : [...prev, chain.trace_id] // Add to collapsed list
@@ -780,7 +778,7 @@ export default function ChatPage() {
                                                 className={`flex items-start justify-between ${hasDetails ? 'cursor-pointer hover:bg-muted/50 rounded p-2 -m-2' : ''}`}
                                                 onClick={() => {
                                                   if (hasDetails) {
-                                                    setExpandedActivities(prev => 
+                                                    setExpandedActivities((prev: string[]) => 
                                                       prev.includes(activityKey) 
                                                         ? prev.filter(key => key !== activityKey)
                                                         : [...prev, activityKey]

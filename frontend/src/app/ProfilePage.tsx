@@ -2,8 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { userAPI, authAPI } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
-
-type ReactChangeEvent = React.ChangeEvent<HTMLInputElement>
+import { getErrorMessage } from '@/lib/utils'
 
 interface UserProfile {
   id: number
@@ -47,8 +46,8 @@ export default function ProfilePage() {
       setProfile(response.data)
       setFirstName(response.data.first_name || '')
       setLastName(response.data.last_name || '')
-    } catch (error: any) {
-      toast.error(error.response?.data?.error || 'Failed to load profile')
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to load profile'))
     } finally {
       setLoading(false)
     }
@@ -58,8 +57,8 @@ export default function ProfilePage() {
     try {
       const response = await userAPI.getUserStats()
       setStats(response.data)
-    } catch (error: any) {
-      console.error('Failed to load stats:', error)
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to load stats'))
     }
   }
 
@@ -73,8 +72,8 @@ export default function ProfilePage() {
       setProfile(response.data.user)
       setEditing(false)
       toast.success('Profile updated successfully')
-    } catch (error: any) {
-      toast.error(error.response?.data?.error || 'Failed to update profile')
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to update profile'))
     } finally {
       setSaving(false)
     }
@@ -101,8 +100,8 @@ export default function ProfilePage() {
       setOldPassword('')
       setNewPassword('')
       setConfirmPassword('')
-    } catch (error: any) {
-      toast.error(error.response?.data?.error || 'Failed to change password')
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to change password'))
     } finally {
       setChangingPassword(false)
     }
@@ -183,7 +182,7 @@ export default function ProfilePage() {
               <input
                 type="text"
                 value={firstName}
-                onChange={(e: ReactChangeEvent) => setFirstName(e.target.value)}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFirstName(e.target.value)}
                 className="w-full px-3 py-2 border rounded-md"
               />
             </div>
@@ -192,7 +191,7 @@ export default function ProfilePage() {
               <input
                 type="text"
                 value={lastName}
-                onChange={(e: ReactChangeEvent) => setLastName(e.target.value)}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setLastName(e.target.value)}
                 className="w-full px-3 py-2 border rounded-md"
               />
             </div>
@@ -221,7 +220,7 @@ export default function ProfilePage() {
             <input
               type="password"
               value={oldPassword}
-              onChange={(e: ReactChangeEvent) => setOldPassword(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setOldPassword(e.target.value)}
               className="w-full px-3 py-2 border rounded-md"
             />
           </div>
@@ -230,7 +229,7 @@ export default function ProfilePage() {
             <input
               type="password"
               value={newPassword}
-              onChange={(e: ReactChangeEvent) => setNewPassword(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewPassword(e.target.value)}
               className="w-full px-3 py-2 border rounded-md"
               minLength={8}
             />
@@ -241,7 +240,7 @@ export default function ProfilePage() {
             <input
               type="password"
               value={confirmPassword}
-              onChange={(e: ReactChangeEvent) => setConfirmPassword(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfirmPassword(e.target.value)}
               className="w-full px-3 py-2 border rounded-md"
               minLength={8}
             />

@@ -2,9 +2,7 @@ import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/state/useAuthStore'
 import { Button } from '@/components/ui/button'
-
-type ReactFormEvent = React.FormEvent<HTMLFormElement>
-type ReactChangeEvent = React.ChangeEvent<HTMLInputElement>
+import { getErrorMessage } from '@/lib/utils'
 
 export default function LoginPage() {
   const [email, setEmail] = useState('')
@@ -14,7 +12,7 @@ export default function LoginPage() {
   const { login } = useAuthStore()
   const navigate = useNavigate()
 
-  const handleSubmit = async (e: ReactFormEvent) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     setError('')
     setLoading(true)
@@ -22,9 +20,8 @@ export default function LoginPage() {
     try {
       await login(email, password)
       navigate('/dashboard')
-    } catch (err: any) {
-      const errorMessage = err.response?.data?.error || err.response?.data?.message || 'Login failed. Please check your credentials.'
-      setError(errorMessage)
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Login failed. Please check your credentials.'))
     } finally {
       setLoading(false)
     }
@@ -44,7 +41,7 @@ export default function LoginPage() {
           <input
             type="email"
             value={email}
-            onChange={(e: ReactChangeEvent) => setEmail(e.target.value)}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEmail(e.target.value)}
             className="w-full px-3 py-2 border rounded-md"
             required
           />
@@ -54,7 +51,7 @@ export default function LoginPage() {
           <input
             type="password"
             value={password}
-            onChange={(e: ReactChangeEvent) => setPassword(e.target.value)}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPassword(e.target.value)}
             className="w-full px-3 py-2 border rounded-md"
             required
           />

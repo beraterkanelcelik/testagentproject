@@ -2,9 +2,7 @@ import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/state/useAuthStore'
 import { Button } from '@/components/ui/button'
-
-type ReactFormEvent = React.FormEvent<HTMLFormElement>
-type ReactChangeEvent = React.ChangeEvent<HTMLInputElement>
+import { getErrorMessage } from '@/lib/utils'
 
 export default function SignupPage() {
   const [email, setEmail] = useState('')
@@ -17,7 +15,7 @@ export default function SignupPage() {
   const { signup } = useAuthStore()
   const navigate = useNavigate()
 
-  const handleSubmit = async (e: ReactFormEvent) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     setError('')
 
@@ -37,9 +35,8 @@ export default function SignupPage() {
     try {
       await signup(email, password, firstName, lastName)
       navigate('/dashboard')
-    } catch (err: any) {
-      const errorMessage = err.response?.data?.error || err.response?.data?.message || 'Signup failed. Please try again.'
-      setError(errorMessage)
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Signup failed. Please try again.'))
     } finally {
       setLoading(false)
     }
@@ -59,7 +56,7 @@ export default function SignupPage() {
           <input
             type="email"
             value={email}
-            onChange={(e: ReactChangeEvent) => setEmail(e.target.value)}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setEmail(e.target.value)}
             className="w-full px-3 py-2 border rounded-md"
             required
           />
@@ -70,7 +67,7 @@ export default function SignupPage() {
             <input
               type="text"
               value={firstName}
-              onChange={(e: ReactChangeEvent) => setFirstName(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFirstName(e.target.value)}
               className="w-full px-3 py-2 border rounded-md"
             />
           </div>
@@ -79,7 +76,7 @@ export default function SignupPage() {
             <input
               type="text"
               value={lastName}
-              onChange={(e: ReactChangeEvent) => setLastName(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setLastName(e.target.value)}
               className="w-full px-3 py-2 border rounded-md"
             />
           </div>
@@ -89,7 +86,7 @@ export default function SignupPage() {
           <input
             type="password"
             value={password}
-            onChange={(e: ReactChangeEvent) => setPassword(e.target.value)}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPassword(e.target.value)}
             className="w-full px-3 py-2 border rounded-md"
             required
             minLength={8}
@@ -103,7 +100,7 @@ export default function SignupPage() {
           <input
             type="password"
             value={confirmPassword}
-            onChange={(e: ReactChangeEvent) => setConfirmPassword(e.target.value)}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfirmPassword(e.target.value)}
             className="w-full px-3 py-2 border rounded-md"
             required
           />

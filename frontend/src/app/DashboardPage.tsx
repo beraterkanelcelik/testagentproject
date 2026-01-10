@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button'
 import { useChatStore, type ChatSession } from '@/state/useChatStore'
 import { documentAPI } from '@/lib/api'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/lib/utils'
 
 interface Document {
   id: number
@@ -29,12 +30,11 @@ export default function DashboardPage() {
       try {
         const response = await documentAPI.getDocuments()
         setDocuments(response.data.documents || [])
-      } catch (error: any) {
-        // Documents endpoint might not be implemented yet
-        console.log('Documents endpoint not available')
+      } catch (error: unknown) {
+        // Documents endpoint might not be implemented yet - silently fail
       }
-    } catch (error: any) {
-      toast.error('Failed to load dashboard data')
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to load dashboard data'))
     } finally {
       setLoading(false)
     }

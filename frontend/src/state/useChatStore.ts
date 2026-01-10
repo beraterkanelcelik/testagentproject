@@ -4,6 +4,7 @@
 import { create } from 'zustand'
 import type { StateCreator } from 'zustand'
 import { chatAPI } from '@/lib/api'
+import { getErrorMessage } from '@/lib/utils'
 
 export interface ChatSession {
   id: number
@@ -21,7 +22,7 @@ export interface Message {
   created_at: string
   metadata?: {
     agent_name?: string
-    tool_calls?: any[]
+    tool_calls?: Array<Record<string, unknown>>
   }
 }
 
@@ -55,8 +56,8 @@ export const useChatStore = create<ChatState>((set: (partial: ChatState | Partia
     try {
       const response = await chatAPI.getSessions()
       set({ sessions: response.data.sessions, loading: false })
-    } catch (error: any) {
-      set({ error: error.response?.data?.error || 'Failed to load sessions', loading: false })
+    } catch (error: unknown) {
+      set({ error: getErrorMessage(error, 'Failed to load sessions'), loading: false })
     }
   },
 
@@ -71,8 +72,8 @@ export const useChatStore = create<ChatState>((set: (partial: ChatState | Partia
         loading: false,
       }))
       return newSession
-    } catch (error: any) {
-      set({ error: error.response?.data?.error || 'Failed to create session', loading: false })
+    } catch (error: unknown) {
+      set({ error: getErrorMessage(error, 'Failed to create session'), loading: false })
       return null
     }
   },
@@ -84,8 +85,8 @@ export const useChatStore = create<ChatState>((set: (partial: ChatState | Partia
       const session = response.data
       set({ currentSession: session, loading: false })
       await get().loadMessages(sessionId)
-    } catch (error: any) {
-      set({ error: error.response?.data?.error || 'Failed to load session', loading: false })
+    } catch (error: unknown) {
+      set({ error: getErrorMessage(error, 'Failed to load session'), loading: false })
     }
   },
 
@@ -93,8 +94,8 @@ export const useChatStore = create<ChatState>((set: (partial: ChatState | Partia
     try {
       const response = await chatAPI.getMessages(sessionId)
       set({ messages: response.data.messages })
-    } catch (error: any) {
-      set({ error: error.response?.data?.error || 'Failed to load messages' })
+    } catch (error: unknown) {
+      set({ error: getErrorMessage(error, 'Failed to load messages') })
     }
   },
 
@@ -103,8 +104,8 @@ export const useChatStore = create<ChatState>((set: (partial: ChatState | Partia
       await chatAPI.sendMessage(sessionId, content)
       // Reload messages to get the new ones
       await get().loadMessages(sessionId)
-    } catch (error: any) {
-      set({ error: error.response?.data?.error || 'Failed to send message' })
+    } catch (error: unknown) {
+      set({ error: getErrorMessage(error, 'Failed to send message') })
       throw error
     }
   },
@@ -117,8 +118,8 @@ export const useChatStore = create<ChatState>((set: (partial: ChatState | Partia
         currentSession: state.currentSession?.id === sessionId ? null : state.currentSession,
         messages: state.currentSession?.id === sessionId ? [] : state.messages,
       }))
-    } catch (error: any) {
-      set({ error: error.response?.data?.error || 'Failed to delete session' })
+    } catch (error: unknown) {
+      set({ error: getErrorMessage(error, 'Failed to delete session') })
     }
   },
 

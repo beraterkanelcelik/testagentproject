@@ -4,8 +4,8 @@ declare module 'react-router-dom' {
   export const Route: any
   export const Link: any
   export const Outlet: any
-  export function useNavigate(): any
-  export function useParams(): any
+  export function useNavigate(): (to: string | number, options?: { state?: any; replace?: boolean }) => void
+  export function useParams(): Record<string, string | undefined>
   export function useLocation(): {
     pathname: string
     search: string

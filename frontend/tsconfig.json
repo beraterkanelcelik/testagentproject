@@ -35,7 +35,7 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src/**/*", "src/types/**/*.d.ts"],
+  "include": ["src/**/*", "src/types/**/*.d.ts", "src/types/modules.d.ts"],
   "exclude": ["node_modules", "dist"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

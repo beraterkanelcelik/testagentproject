@@ -4,9 +4,7 @@ import { useAuthStore } from '@/state/useAuthStore'
 import { useChatStore } from '@/state/useChatStore'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
-
-type ReactFormEvent = React.FormEvent<HTMLFormElement>
-type ReactChangeEvent = React.ChangeEvent<HTMLInputElement>
+import { getErrorMessage } from '@/lib/utils'
 
 export default function HomePage() {
   const { isAuthenticated } = useAuthStore()
@@ -15,7 +13,7 @@ export default function HomePage() {
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
 
-  const handleSubmit = async (e: ReactFormEvent) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (!input.trim() || !isAuthenticated) return
 
@@ -32,8 +30,8 @@ export default function HomePage() {
         toast.error('Failed to create chat session')
         setSending(false)
       }
-    } catch (error: any) {
-      toast.error('Failed to start chat')
+    } catch (error: unknown) {
+      toast.error(getErrorMessage(error, 'Failed to start chat'))
       setSending(false)
     }
   }
@@ -51,7 +49,7 @@ export default function HomePage() {
             <input
               type="text"
               value={input}
-              onChange={(e: ReactChangeEvent) => setInput(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setInput(e.target.value)}
               placeholder="Ask me anything..."
               className="flex-1 px-4 py-3 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary"
               disabled={sending}
