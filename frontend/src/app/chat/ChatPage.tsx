@@ -20,7 +20,7 @@ export default function ChatPage() {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [sessionToDelete, setSessionToDelete] = useState<number | null>(null)
   const [deleteAllDialogOpen, setDeleteAllDialogOpen] = useState(false)
-  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [sidebarOpen, setSidebarOpen] = useState(true)
   const [moreMenuOpen, setMoreMenuOpen] = useState(false)
   const [attachedFiles, setAttachedFiles] = useState<File[]>([])
   const [waitingForResponse, setWaitingForResponse] = useState(false)
@@ -242,6 +242,10 @@ export default function ChatPage() {
 
   const handleSelectSession = (id: number) => {
     navigate(`/chat/${id}`)
+    // Keep sidebar open on mobile/tablet, close on desktop for better UX
+    if (window.innerWidth >= 768) {
+      setSidebarOpen(false)
+    }
   }
 
   const handleSend = async () => {
@@ -399,7 +403,6 @@ export default function ChatPage() {
                   key={session.id}
                   onClick={() => {
                     handleSelectSession(session.id)
-                    setSidebarOpen(false)
                   }}
                   className={`p-3 cursor-pointer hover:bg-muted/50 transition-colors ${
                     currentSession?.id === session.id ? 'bg-muted/50' : ''
