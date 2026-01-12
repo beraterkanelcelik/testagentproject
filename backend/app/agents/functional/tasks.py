@@ -1,6 +1,8 @@
 """
 Task functions for LangGraph Functional API.
 """
+import asyncio
+import json
 from typing import List, Dict, Any, Optional
 from langgraph.func import task
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -142,6 +144,8 @@ def greeter_agent_task(
         AgentResponse with reply
     """
     try:
+        logger.info(f"[GREETER_TASK] Starting greeter_agent_task query_preview={query[:50] if query else '(empty)'}... user_id={user_id} messages_count={len(messages)}")
+        
         # Check if summarization is needed
         needs_summarization = check_summarization_needed_task(
             messages=messages,
@@ -193,7 +197,9 @@ def greeter_agent_task(
         if config:
             invoke_kwargs['config'] = config
         
+        logger.info(f"[GREETER_TASK] Invoking greeter agent with {len(messages)} messages, config_present={bool(config)}")
         response = greeter_agent.invoke(messages, **invoke_kwargs)
+        logger.info(f"[GREETER_TASK] Greeter agent response received: type={type(response)}, has_content={hasattr(response, 'content')}, content_length={len(response.content) if hasattr(response, 'content') and response.content else 0}, content_preview={response.content[:50] if hasattr(response, 'content') and response.content else '(empty)'}...")
         
         # Extract token usage
         token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -229,15 +235,21 @@ def greeter_agent_task(
         if hasattr(response, 'tool_calls') and response.tool_calls:
             messages = messages + [response]
         
-        return AgentResponse(
+        reply_content = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"[GREETER_TASK] Creating AgentResponse: reply_length={len(reply_content) if reply_content else 0}, tool_calls_count={len(tool_calls)}")
+        
+        agent_response = AgentResponse(
             type="answer",
-            reply=response.content if hasattr(response, 'content') else str(response),
+            reply=reply_content,
             tool_calls=tool_calls,
             token_usage=token_usage,
             agent_name=greeter_agent.name  # Use agent's actual name property
         )
+        
+        logger.info(f"[GREETER_TASK] Returning AgentResponse: has_reply={bool(agent_response.reply)}, reply_preview={agent_response.reply[:50] if agent_response.reply else '(empty)'}...")
+        return agent_response
     except Exception as e:
-        logger.error(f"Error in greeter_agent_task: {e}", exc_info=True)
+        logger.error(f"[GREETER_TASK] Error in greeter_agent_task: {e}", exc_info=True)
         # Fallback: use "greeter" if agent instance is not available
         return AgentResponse(
             type="answer",
@@ -319,7 +331,9 @@ def search_agent_task(
         if config:
             invoke_kwargs['config'] = config
         
+        logger.info(f"[SEARCH_TASK] Invoking search agent with {len(messages)} messages, config_present={bool(config)}")
         response = search_agent.invoke(messages, **invoke_kwargs)
+        logger.info(f"[SEARCH_TASK] Search agent response received: type={type(response)}, has_content={hasattr(response, 'content')}, content_length={len(response.content) if hasattr(response, 'content') and response.content else 0}, has_tool_calls={hasattr(response, 'tool_calls') and bool(response.tool_calls)}, tool_calls_count={len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0}")
         
         # Extract token usage
         token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -342,26 +356,37 @@ def search_agent_task(
         # Extract tool calls (preserve full tool_call structure including IDs)
         tool_calls = []
         if hasattr(response, 'tool_calls') and response.tool_calls:
+            logger.info(f"[SEARCH_TASK] Extracting {len(response.tool_calls)} tool calls from response")
             for tc in response.tool_calls:
-                tool_calls.append({
+                tool_call_dict = {
                     "tool": tc.get("name", ""),
                     "name": tc.get("name", ""),
                     "args": tc.get("args", {}),
                     "id": tc.get("id", ""),  # Preserve tool_call ID
-                })
+                }
+                tool_calls.append(tool_call_dict)
+                logger.info(f"[SEARCH_TASK] Extracted tool call: name={tool_call_dict['name']}, args={tool_call_dict['args']}, id={tool_call_dict['id']}")
+        else:
+            logger.info(f"[SEARCH_TASK] No tool calls in response: has_tool_calls_attr={hasattr(response, 'tool_calls')}, tool_calls_value={getattr(response, 'tool_calls', None)}")
         
         # Add the AIMessage to messages list if it has tool_calls
         # This is needed for proper ToolMessage handling
         if hasattr(response, 'tool_calls') and response.tool_calls:
             messages = messages + [response]
         
-        return AgentResponse(
+        reply_content = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"[SEARCH_TASK] Creating AgentResponse: reply_length={len(reply_content) if reply_content else 0}, tool_calls_count={len(tool_calls)}")
+        
+        agent_response = AgentResponse(
             type="answer",
-            reply=response.content if hasattr(response, 'content') else str(response),
+            reply=reply_content,
             tool_calls=tool_calls,
             token_usage=token_usage,
             agent_name=search_agent.name  # Use agent's actual name property
         )
+        
+        logger.info(f"[SEARCH_TASK] Returning AgentResponse: has_reply={bool(agent_response.reply)}, reply_preview={agent_response.reply[:50] if agent_response.reply else '(empty)'}..., tool_calls_count={len(agent_response.tool_calls)}")
+        return agent_response
     except Exception as e:
         logger.error(f"Error in search_agent_task: {e}", exc_info=True)
         return AgentResponse(
@@ -415,6 +440,20 @@ def tool_execution_task(
     chat_session_id: Optional[int] = None,
     config: Optional[RunnableConfig] = None
 ) -> List[ToolResult]:
+    """
+    Execute tools and return results.
+    
+    Args:
+        tool_calls: List of tool call dictionaries with 'name' and 'args'
+        user_id: User ID for tool access
+        agent_name: Agent name (for tool registry lookup)
+        chat_session_id: Optional chat session ID
+        config: Optional runtime config (for callbacks)
+        
+    Returns:
+        List of ToolResult objects
+    """
+    logger.info(f"[TOOL_EXECUTION] Starting execution of {len(tool_calls)} tools for agent={agent_name}: {[tc.get('name') for tc in tool_calls]}")
     """
     Execute tools from tool calls with Langfuse tracking.
     
@@ -537,7 +576,8 @@ def tool_execution_task(
                     output=result,
                     error=""
                 ))
-                logger.info(f"Tool {tool_name} executed successfully")
+                output_preview = str(result)[:100] if result else "(empty)"
+                logger.info(f"[TOOL_EXECUTION] Tool {tool_name} executed successfully: output_length={len(str(result)) if result else 0}, output_preview={output_preview}...")
             except Exception as e:
                 logger.error(f"Error executing tool {tool_name}: {e}", exc_info=True)
                 
@@ -575,6 +615,7 @@ def tool_execution_task(
                 error=f"Tool {tool_name} is not available"
             ))
     
+    logger.info(f"[TOOL_EXECUTION] Completed execution: {len(results)} results returned")
     return results
 
 
@@ -608,15 +649,20 @@ def agent_with_tool_results_task(
         AgentResponse with formatted answer
     """
     try:
+        logger.info(f"[AGENT_WITH_TOOL_RESULTS] Starting for agent={agent_name}, query_preview={query[:50] if query else '(empty)'}..., messages_count={len(messages)}, tool_results_count={len(tool_results) if tool_results else 0}")
+        
         # Route to appropriate agent task
         # Note: config is automatically injected by LangGraph, don't pass it explicitly
         if agent_name == "greeter":
-            return greeter_agent_task(query, messages, user_id, model_name).result()
+            result = greeter_agent_task(query, messages, user_id, model_name).result()
         elif agent_name == "search":
-            return search_agent_task(query, messages, user_id, model_name).result()
+            result = search_agent_task(query, messages, user_id, model_name).result()
         else:
             # Fallback to greeter
-            return greeter_agent_task(query, messages, user_id, model_name).result()
+            result = greeter_agent_task(query, messages, user_id, model_name).result()
+        
+        logger.info(f"[AGENT_WITH_TOOL_RESULTS] Agent task returned: has_reply={bool(result.reply)}, reply_preview={result.reply[:50] if result.reply else '(empty)'}..., tool_calls_count={len(result.tool_calls) if result.tool_calls else 0}")
+        return result
     except Exception as e:
         logger.error(f"Error in agent_with_tool_results_task: {e}", exc_info=True)
         return AgentResponse(
@@ -759,7 +805,8 @@ def save_message_task(
             metadata=metadata
         )
         
-        logger.debug(f"Saved message {message.id} to session {session_id}")
+        logger.info(f"[MESSAGE_SAVE] Saved assistant message ID={message.id} session={session_id} agent={response.agent_name} content_preview={content[:50]}... tokens={response.token_usage.get('total_tokens', 0) if response.token_usage else 0}")
+        
         return True
     except Exception as e:
         logger.error(f"Error saving message: {e}", exc_info=True)

@@ -1,11 +1,13 @@
 """
 Main workflow entrypoint for LangGraph Functional API.
 """
-from typing import Optional, List, Dict, Any
+import asyncio
+from typing import Optional, List, Dict, Any, AsyncIterator
 from langgraph.func import entrypoint
 from langgraph.checkpoint.postgres import PostgresSaver
 from langchain_core.messages import HumanMessage, ToolMessage
 from app.agents.functional.models import AgentRequest, AgentResponse, ToolProposal
+from app.agents.functional.streaming import EventCallbackHandler
 from app.agents.functional.tasks import (
     supervisor_task,
     load_messages_task,
@@ -195,17 +197,23 @@ def ai_agent_workflow(request: AgentRequest) -> AgentResponse:
     from langfuse import get_client
     from app.agents.config import LANGFUSE_ENABLED
     
-    # Create trace for workflow if Langfuse is enabled
+    # Create span for workflow if Langfuse is enabled
+    # Use trace_id from request if available (created in activity)
+    # Note: We use start_observation() here (not start_as_current_observation) because
+    # the workflow runs in a separate thread context. The CallbackHandler will use
+    # the OpenTelemetry context set via propagate_attributes() in the thread.
     langfuse = None
     trace_span = None
-    if LANGFUSE_ENABLED:
+    if LANGFUSE_ENABLED and request.trace_id:
         try:
             langfuse = get_client()
             if langfuse:
-                # Use start_observation() to get the observation object directly
-                # (start_as_current_observation returns a context manager)
+                # Create span within the trace hierarchy using trace_context
+                # This creates the span but doesn't make it "current" in this context
+                # The propagate_attributes() in the thread will ensure CallbackHandler uses the trace
                 trace_span = langfuse.start_observation(
                     as_type="span",
+                    trace_context={"trace_id": request.trace_id},
                     name="ai_agent_workflow",
                     metadata={
                         "flow": request.flow,
@@ -214,8 +222,9 @@ def ai_agent_workflow(request: AgentRequest) -> AgentResponse:
                         "session_id": str(request.session_id) if request.session_id else None,
                     }
                 )
+                logger.debug(f"[LANGFUSE] Created workflow span for trace_id={request.trace_id}")
         except Exception as e:
-            logger.warning(f"Failed to create Langfuse trace for workflow: {e}")
+            logger.warning(f"Failed to create Langfuse span for workflow: {e}", exc_info=True)
     
     try:
         # Get thread ID for checkpoint
@@ -264,6 +273,7 @@ def ai_agent_workflow(request: AgentRequest) -> AgentResponse:
         
         # Route to appropriate agent
         if routing.agent == "greeter":
+            logger.info(f"[WORKFLOW] Routing to greeter agent for query_preview={routing.query[:50] if routing.query else '(empty)'}...")
             response = greeter_agent_task(
                 query=routing.query,
                 messages=messages,
@@ -271,7 +281,9 @@ def ai_agent_workflow(request: AgentRequest) -> AgentResponse:
                 model_name=None,
                 config=checkpoint_config
             ).result()
+            logger.info(f"[WORKFLOW] Greeter agent returned: has_reply={bool(response.reply)}, reply_preview={response.reply[:50] if response.reply else '(empty)'}...")
         elif routing.agent == "search":
+            logger.info(f"[WORKFLOW] Routing to search agent for query_preview={routing.query[:50] if routing.query else '(empty)'}...")
             response = search_agent_task(
                 query=routing.query,
                 messages=messages,
@@ -279,6 +291,7 @@ def ai_agent_workflow(request: AgentRequest) -> AgentResponse:
                 model_name=None,
                 config=checkpoint_config
             ).result()
+            logger.info(f"[WORKFLOW] Search agent returned: has_reply={bool(response.reply)}, reply_preview={response.reply[:50] if response.reply else '(empty)'}..., tool_calls_count={len(response.tool_calls) if response.tool_calls else 0}")
         else:
             response = agent_task(
                 agent_name=routing.agent,
@@ -357,7 +370,7 @@ def ai_agent_workflow(request: AgentRequest) -> AgentResponse:
             
             # Auto-execute tools in parallel if any
             if auto_executable:
-                logger.info(f"Auto-executing {len(auto_executable)} tools")
+                logger.info(f"[WORKFLOW] Auto-executing {len(auto_executable)} tools for agent={routing.agent}: {[p.tool for p in auto_executable]}")
                 tool_calls_auto = [
                     {"name": p.tool, "args": p.props}
                     for p in auto_executable
@@ -370,6 +383,7 @@ def ai_agent_workflow(request: AgentRequest) -> AgentResponse:
                     chat_session_id=request.session_id,
                     config=checkpoint_config
                 ).result()
+                logger.info(f"[WORKFLOW] Tool execution completed: {len(tool_results)} results, results_preview={[{'tool': tr.tool, 'has_output': bool(tr.output), 'has_error': bool(tr.error)} for tr in tool_results]}")
                 
                 # Update tool_calls with execution status
                 # Mark executed tools as completed or error
@@ -454,6 +468,7 @@ def ai_agent_workflow(request: AgentRequest) -> AgentResponse:
                 executed_tool_calls_with_status = response.tool_calls.copy() if response.tool_calls else []
                 
                 # Re-invoke agent with tool results (refine)
+                logger.info(f"[WORKFLOW] Invoking agent_with_tool_results_task for agent={routing.agent} with {len(tool_results)} tool results, messages_count={len(messages)}")
                 refined_response = agent_with_tool_results_task(
                     agent_name=routing.agent,
                     query=routing.query,
@@ -463,6 +478,7 @@ def ai_agent_workflow(request: AgentRequest) -> AgentResponse:
                     model_name=None,
                     config=checkpoint_config
                 ).result()
+                logger.info(f"[WORKFLOW] agent_with_tool_results_task returned: has_reply={bool(refined_response.reply)}, reply_preview={refined_response.reply[:50] if refined_response.reply else '(empty)'}..., tool_calls_count={len(refined_response.tool_calls) if refined_response.tool_calls else 0}")
                 
                 # Preserve tool_calls from original response (with statuses) in refined response
                 # This ensures tool_calls with execution statuses are saved
@@ -543,11 +559,10 @@ def ai_agent_workflow(request: AgentRequest) -> AgentResponse:
                         "tool_calls_count": len(response.tool_calls) if response.tool_calls else 0,
                     }
                 )
-                trace_span.end()
             except Exception as e:
                 logger.warning(f"Failed to update Langfuse trace: {e}")
             finally:
-                # Ensure span is ended even if update fails
+                # Ensure span is ended
                 try:
                     if trace_span:
                         trace_span.end()
@@ -605,16 +620,18 @@ def _execute_plan_workflow(
     from langfuse import get_client
     from app.agents.config import LANGFUSE_ENABLED
     
-    # Create trace for plan execution if Langfuse is enabled
+    # Create span for plan execution if Langfuse is enabled
+    # Use trace_id from request if available (created in activity)
     langfuse = None
     plan_span = None
-    if LANGFUSE_ENABLED:
+    if LANGFUSE_ENABLED and request.trace_id:
         try:
             langfuse = get_client()
             if langfuse:
-                # Use start_observation() to get the observation object directly
+                # Create span within the trace hierarchy using trace_context
                 plan_span = langfuse.start_observation(
                     as_type="span",
+                    trace_context={"trace_id": request.trace_id},
                     name="plan_execution",
                     metadata={
                         "plan_steps_count": len(request.plan_steps) if request.plan_steps else 0,
@@ -622,8 +639,9 @@ def _execute_plan_workflow(
                         "session_id": str(request.session_id) if request.session_id else None,
                     }
                 )
+                logger.debug(f"[LANGFUSE] Created plan execution span for trace_id={request.trace_id}")
         except Exception as e:
-            logger.warning(f"Failed to create Langfuse trace for plan execution: {e}")
+            logger.warning(f"Failed to create Langfuse span for plan execution: {e}", exc_info=True)
     
     try:
         
@@ -759,3 +777,312 @@ def _execute_plan_workflow(
             reply=f"I apologize, but I encountered an error executing the plan: {str(e)}",
             agent_name="system"
         )
+
+
+async def ai_agent_workflow_events(request: AgentRequest) -> AsyncIterator[Dict[str, Any]]:
+    """
+    Event-emitting wrapper around ai_agent_workflow.
+    Yields structured events during workflow execution.
+    
+    Args:
+        request: AgentRequest with query, session_id, user_id, etc.
+        
+    Yields:
+        Event dictionaries with type and data
+    """
+    from threading import Thread
+    from queue import Queue as ThreadQueue, Empty
+    
+    # Status messages mapping
+    status_messages = {
+        "supervisor_task": "Routing to agent...",
+        "load_messages_task": "Loading conversation history...",
+        "check_summarization_needed_task": "Checking if summarization needed...",
+        "greeter_agent_task": "Processing with greeter agent...",
+        "search_agent_task": "Searching documents...",
+        "agent_task": "Processing with agent...",
+        "tool_execution_task": "Executing tools...",
+        "agent_with_tool_results_task": "Processing tool results...",
+        "save_message_task": "Saving message...",
+    }
+    
+    # Create thread-safe queue for events from callbacks
+    event_queue = ThreadQueue()
+    
+    # Create event callback handler for streaming
+    callback_handler = EventCallbackHandler(event_queue, status_messages)
+    
+    # Get checkpoint config
+    thread_id = f"chat_session_{request.session_id}" if request.session_id else f"user_{request.user_id}"
+    checkpoint_config = get_checkpoint_config(request.session_id) if request.session_id else {"configurable": {"thread_id": thread_id}}
+    
+    # Add callbacks to config
+    if 'callbacks' not in checkpoint_config:
+        checkpoint_config['callbacks'] = []
+    checkpoint_config['callbacks'].append(callback_handler)
+    
+    # Add Langfuse CallbackHandler if enabled and trace_id is available
+    # This captures LLM calls and associates them with the trace
+    from app.agents.config import LANGFUSE_ENABLED
+    if LANGFUSE_ENABLED and request.trace_id:
+        try:
+            from app.observability.tracing import get_callback_handler
+            langfuse_callback = get_callback_handler()
+            if langfuse_callback:
+                checkpoint_config['callbacks'].append(langfuse_callback)
+                logger.debug(f"[LANGFUSE] Added CallbackHandler to workflow for trace_id={request.trace_id}")
+        except Exception as e:
+            logger.warning(f"Failed to add Langfuse CallbackHandler: {e}", exc_info=True)
+    
+    # Track final response - use list for thread-safe sharing
+    final_response_holder = [None]
+    exception_holder = [None]
+    
+    # Run workflow in a thread (since stream() is sync)
+    def run_workflow():
+        try:
+            # Use propagate_attributes to set trace context for Langfuse CallbackHandler
+            # This ensures all LLM calls are associated with the trace
+            from app.agents.config import LANGFUSE_ENABLED
+            from langfuse import propagate_attributes
+            from app.observability.tracing import prepare_trace_context
+            
+            if LANGFUSE_ENABLED and request.trace_id:
+                # Create active workflow span using start_as_current_observation
+                # This makes it the active observation in OpenTelemetry context
+                # The CallbackHandler will automatically use this as the parent trace
+                from langfuse import get_client
+                langfuse = get_client()
+                if langfuse:
+                    # Prepare trace context for propagate_attributes
+                    trace_context = prepare_trace_context(
+                        user_id=request.user_id or 0,
+                        session_id=request.session_id,
+                        metadata={"trace_id": request.trace_id}  # Store trace_id in metadata for reference
+                    )
+                    
+                    # Create active workflow span with trace_context - this makes it the active observation
+                    with langfuse.start_as_current_observation(
+                        as_type="span",
+                        trace_context={"trace_id": request.trace_id},
+                        name="ai_agent_workflow",
+                        metadata={
+                            "flow": request.flow,
+                            "has_plan_steps": bool(request.plan_steps),
+                            "user_id": str(request.user_id) if request.user_id else None,
+                            "session_id": str(request.session_id) if request.session_id else None,
+                        }
+                    ) as workflow_span:
+                        # Use propagate_attributes to propagate user_id, session_id, metadata to all child observations
+                        with propagate_attributes(**trace_context):
+                            # Use stream() to get state updates
+                            # LangGraph Functional API stream() returns state dictionaries
+                            # The final chunk should contain the AgentResponse
+                            chunk_count = 0
+                            for chunk in ai_agent_workflow.stream(request, config=checkpoint_config):
+                                chunk_count += 1
+                                logger.debug(f"[STREAM_CHUNK] Received chunk #{chunk_count}, type={type(chunk)}, keys={list(chunk.keys()) if isinstance(chunk, dict) else 'N/A'}")
+                                
+                                # chunk is a state dictionary
+                                # The final chunk contains the AgentResponse
+                                if isinstance(chunk, dict):
+                                    # Check if this chunk contains the response
+                                    # LangGraph Functional API may return response under different keys
+                                    if 'ai_agent_workflow' in chunk:
+                                        response_data = chunk['ai_agent_workflow']
+                                        logger.debug(f"[STREAM_CHUNK] Found 'ai_agent_workflow' key, response_data type={type(response_data)}")
+                                        if isinstance(response_data, AgentResponse):
+                                            final_response_holder[0] = response_data
+                                            logger.info(f"[STREAM_CHUNK] Extracted AgentResponse from 'ai_agent_workflow' key: agent={response_data.agent_name}, has_reply={bool(response_data.reply)}")
+                                        elif isinstance(response_data, dict):
+                                            # Try to construct AgentResponse from dict
+                                            try:
+                                                final_response_holder[0] = AgentResponse(**response_data)
+                                                logger.info(f"[STREAM_CHUNK] Constructed AgentResponse from dict: agent={final_response_holder[0].agent_name}, has_reply={bool(final_response_holder[0].reply)}")
+                                            except Exception as e:
+                                                logger.warning(f"[STREAM_CHUNK] Failed to construct AgentResponse from dict: {e}")
+                                    elif any(key in chunk for key in ['agent_name', 'reply', 'tool_calls', 'type']):
+                                        # Might be the response directly as a dict
+                                        try:
+                                            final_response_holder[0] = AgentResponse(**chunk)
+                                            logger.info(f"[STREAM_CHUNK] Constructed AgentResponse from chunk dict: agent={final_response_holder[0].agent_name}, has_reply={bool(final_response_holder[0].reply)}")
+                                        except Exception as e:
+                                            logger.warning(f"[STREAM_CHUNK] Failed to construct AgentResponse from chunk: {e}, chunk_keys={list(chunk.keys())}")
+                                elif isinstance(chunk, AgentResponse):
+                                    final_response_holder[0] = chunk
+                                    logger.info(f"[STREAM_CHUNK] Chunk is AgentResponse directly: agent={chunk.agent_name}, has_reply={bool(chunk.reply)}")
+                            
+                            if final_response_holder[0]:
+                                logger.info(f"[STREAM_CHUNK] Final response extracted successfully: agent={final_response_holder[0].agent_name}, type={final_response_holder[0].type}, has_reply={bool(final_response_holder[0].reply)}")
+                            else:
+                                logger.warning(f"[STREAM_CHUNK] No final response extracted after {chunk_count} chunks")
+                            
+                            # Update workflow span with final response
+                            if final_response_holder[0]:
+                                try:
+                                    workflow_span.update(
+                                        output={
+                                            "type": final_response_holder[0].type,
+                                            "agent_name": final_response_holder[0].agent_name,
+                                            "has_reply": bool(final_response_holder[0].reply),
+                                        }
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"Failed to update workflow span: {e}")
+            else:
+                # No Langfuse tracing - run without context managers
+                chunk_count = 0
+                for chunk in ai_agent_workflow.stream(request, config=checkpoint_config):
+                    chunk_count += 1
+                    logger.debug(f"[STREAM_CHUNK] Received chunk #{chunk_count}, type={type(chunk)}, keys={list(chunk.keys()) if isinstance(chunk, dict) else 'N/A'}")
+                    
+                    # chunk is a state dictionary
+                    # The final chunk contains the AgentResponse
+                    if isinstance(chunk, dict):
+                        # Check if this chunk contains the response
+                        # LangGraph Functional API may return response under different keys
+                        if 'ai_agent_workflow' in chunk:
+                            response_data = chunk['ai_agent_workflow']
+                            logger.debug(f"[STREAM_CHUNK] Found 'ai_agent_workflow' key, response_data type={type(response_data)}")
+                            if isinstance(response_data, AgentResponse):
+                                final_response_holder[0] = response_data
+                                logger.info(f"[STREAM_CHUNK] Extracted AgentResponse from 'ai_agent_workflow' key: agent={response_data.agent_name}, has_reply={bool(response_data.reply)}")
+                            elif isinstance(response_data, dict):
+                                # Try to construct AgentResponse from dict
+                                try:
+                                    final_response_holder[0] = AgentResponse(**response_data)
+                                    logger.info(f"[STREAM_CHUNK] Constructed AgentResponse from dict: agent={final_response_holder[0].agent_name}, has_reply={bool(final_response_holder[0].reply)}")
+                                except Exception as e:
+                                    logger.warning(f"[STREAM_CHUNK] Failed to construct AgentResponse from dict: {e}")
+                        elif isinstance(chunk, AgentResponse):
+                            final_response_holder[0] = chunk
+                            logger.info(f"[STREAM_CHUNK] Chunk is AgentResponse directly: agent={chunk.agent_name}, has_reply={bool(chunk.reply)}")
+                        elif any(key in chunk for key in ['agent_name', 'reply', 'tool_calls', 'type']):
+                            # Might be the response directly as a dict
+                            try:
+                                final_response_holder[0] = AgentResponse(**chunk)
+                                logger.info(f"[STREAM_CHUNK] Constructed AgentResponse from chunk dict: agent={final_response_holder[0].agent_name}, has_reply={bool(final_response_holder[0].reply)}")
+                            except Exception as e:
+                                logger.warning(f"[STREAM_CHUNK] Failed to construct AgentResponse from chunk: {e}, chunk_keys={list(chunk.keys())}")
+                    elif isinstance(chunk, AgentResponse):
+                        final_response_holder[0] = chunk
+                        logger.info(f"[STREAM_CHUNK] Chunk is AgentResponse directly: agent={chunk.agent_name}, has_reply={bool(chunk.reply)}")
+                
+                if final_response_holder[0]:
+                    logger.info(f"[STREAM_CHUNK] Final response extracted successfully: agent={final_response_holder[0].agent_name}, type={final_response_holder[0].type}, has_reply={bool(final_response_holder[0].reply)}")
+                else:
+                    logger.warning(f"[STREAM_CHUNK] No final response extracted after {chunk_count} chunks")
+        except Exception as e:
+            logger.error(f"Error in workflow execution: {e}", exc_info=True)
+            exception_holder[0] = e
+    
+    # Start workflow in background thread
+    workflow_thread = Thread(target=run_workflow, daemon=True)
+    workflow_thread.start()
+    logger.info(f"[EVENT_QUEUE] Started workflow thread, waiting for events (queue_size={event_queue.qsize()})")
+    
+    # Yield events from queue while workflow runs
+    workflow_done = False
+    timeout_count = 0
+    max_timeout = 600  # 10 minutes total
+    events_yielded = 0
+    
+    while not workflow_done and timeout_count < max_timeout:
+        try:
+            # Poll thread-safe queue (non-blocking)
+            try:
+                event = event_queue.get_nowait()
+                timeout_count = 0  # Reset timeout on event
+                event_type = event.get("type", "unknown")
+                events_yielded += 1
+                logger.info(f"[EVENT_QUEUE] Consumed event #{events_yielded} type={event_type} (queue_size={event_queue.qsize()})")
+                if event_type == "token":
+                    logger.debug(f"[EVENT_QUEUE] Token value: {event.get('value', '')[:30]}...")
+                yield event
+                
+                # Check for final event
+                if event_type == "final":
+                    workflow_done = True
+                    logger.info(f"[EVENT_QUEUE] Received final event, stopping queue consumption")
+                    break
+            except Empty:
+                timeout_count += 1
+                # Check if workflow thread is still alive
+                if not workflow_thread.is_alive():
+                    logger.debug(f"[EVENT_QUEUE] Workflow thread finished, checking for remaining events (queue_size={event_queue.qsize()})")
+                    workflow_done = True
+                    # Try to drain remaining events from queue
+                    try:
+                        while True:
+                            event = event_queue.get_nowait()
+                            event_type = event.get("type", "unknown")
+                            logger.debug(f"[EVENT_QUEUE] Draining event type={event_type} after thread completion")
+                            yield event
+                            if event_type == "final":
+                                break
+                    except Empty:
+                        pass
+                    break
+                # Sleep briefly to avoid busy-waiting
+                await asyncio.sleep(0.1)
+                continue
+                
+        except Exception as e:
+            logger.error(f"[EVENT_QUEUE] Error reading from event queue: {e}", exc_info=True)
+            break
+    
+    # Wait for workflow thread to complete
+    workflow_thread.join(timeout=5.0)
+    
+    # Check for exceptions
+    if exception_holder[0]:
+        yield {
+            "type": "error",
+            "error": str(exception_holder[0])
+        }
+        return
+    
+    # Yield final response if we have it (get from thread-safe holder)
+    final_response = final_response_holder[0]
+    if final_response:
+        # Extract tool_calls and agent_name for update event
+        if final_response.tool_calls or final_response.agent_name:
+            update_data = {}
+            if final_response.agent_name:
+                update_data["agent_name"] = final_response.agent_name
+            if final_response.tool_calls:
+                formatted_tool_calls = []
+                for tc in final_response.tool_calls:
+                    formatted_tc = {
+                        "name": tc.get("name") or tc.get("tool", ""),
+                        "tool": tc.get("name") or tc.get("tool", ""),
+                        "args": tc.get("args", {}),
+                        "status": tc.get("status", "completed"),
+                    }
+                    if tc.get("id"):
+                        formatted_tc["id"] = tc.get("id")
+                    if tc.get("output"):
+                        formatted_tc["output"] = tc.get("output")
+                    if tc.get("error"):
+                        formatted_tc["error"] = tc.get("error")
+                    formatted_tool_calls.append(formatted_tc)
+                update_data["tool_calls"] = formatted_tool_calls
+            
+            if update_data:
+                yield {
+                    "type": "update",
+                    "data": update_data
+                }
+        
+        yield {
+            "type": "final",
+            "response": final_response
+        }
+    else:
+        # No final response extracted - this should not happen if extraction works correctly
+        # Log error instead of invoking workflow again (which causes double execution)
+        logger.error(f"[STREAM_ERROR] No final response extracted from stream chunks. This indicates a bug in extraction logic.")
+        yield {
+            "type": "error",
+            "error": "Failed to extract final response from workflow stream. Check logs for details."
+        }

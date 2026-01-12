@@ -54,7 +54,7 @@ services:
     tty: true
     networks:
       - app-network
-    command: sh -c "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"
+    command: sh -c "python manage.py migrate --noinput && uvicorn app.asgi:application --host 0.0.0.0 --port 8000 --reload"
 
   # Frontend (React + Vite)
   frontend:
@@ -293,14 +293,89 @@ services:
       --requirepass ${REDIS_AUTH:-myredissecret}
       --maxmemory-policy noeviction
     ports:
-      - 127.0.0.1:6379:6379
+      - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_AUTH:-myredissecret}", "ping"]
       interval: 3s
       timeout: 10s
       retries: 10
     networks:
       - app-network
+
+  # Temporal Server
+  temporal:
+    image: temporalio/auto-setup:1.23
+    container_name: temporal
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PWD: ${DB_PASSWORD:-postgres}
+      POSTGRES_SEEDS: db
+      SKIP_DEFAULT_NAMESPACE_CREATION: "false"
+    ports:
+      - "7233:7233"
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -q '[t]emporal-server' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - app-network
+
+  # Temporal UI
+  temporal-ui:
+    image: temporalio/ui:2.44.0
+    container_name: temporal-ui
+    restart: unless-stopped
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports:
+      - "8080:8080"
+    networks:
+      - app-network
+
+  # Temporal Worker
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: temporal-worker
+    restart: unless-stopped
+    depends_on:
+      temporal:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DEBUG=True
+      - DB_HOST=db
+      - DB_NAME=${DB_NAME:-ai_agents_db}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_PORT=5432
+      - TEMPORAL_ADDRESS=temporal:7233
+      - REDIS_URL=redis://redis:6379
+      - REDIS_AUTH=${REDIS_AUTH:-myredissecret}
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    networks:
+      - app-network
+    command: python -m app.agents.temporal.worker
 
 volumes:
   postgres_data:

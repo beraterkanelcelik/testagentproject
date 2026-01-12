@@ -204,18 +204,20 @@ export default function ServiceStatus() {
       'backend': 'Backend API',
       'cache': 'Cache',
       'frontend': 'Frontend',
+      'temporal': 'Temporal',
     }
     return nameMap[name.toLowerCase()] || name.charAt(0).toUpperCase() + name.slice(1)
   }
 
-  // Order services: frontend, backend, database, langfuse, cache, then others
+  // Order services: frontend, backend, database, temporal, langfuse, cache, then others
   const getServiceOrder = (name: string): number => {
     const orderMap: Record<string, number> = {
       'frontend': 1,
       'backend': 2,
       'database': 3,
-      'langfuse': 4,
-      'cache': 5,
+      'temporal': 4,
+      'langfuse': 5,
+      'cache': 6,
     }
     return orderMap[name.toLowerCase()] || 99
   }

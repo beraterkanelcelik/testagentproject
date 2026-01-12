@@ -108,7 +108,7 @@ def update_session_title(user_id: int, session_id: int, title: str) -> Optional[
 
 def delete_session(user_id: int, session_id: int) -> bool:
     """
-    Delete a chat session.
+    Delete a chat session and terminate its Temporal workflow.
     
     Args:
         user_id: User ID
@@ -119,6 +119,19 @@ def delete_session(user_id: int, session_id: int) -> bool:
     """
     try:
         session = ChatSession.objects.get(id=session_id, user_id=user_id)
+        
+        # Terminate Temporal workflow before deleting session
+        try:
+            from asgiref.sync import async_to_sync
+            from app.agents.temporal.workflow_manager import terminate_workflow
+            
+            # Use async_to_sync instead of creating new event loop
+            # This avoids "Future attached to different loop" errors
+            async_to_sync(terminate_workflow)(user_id, session_id)
+        except Exception as e:
+            logger.warning(f"Failed to terminate workflow for session {session_id}: {e}")
+            # Continue with deletion even if workflow termination fails
+        
         session.delete()
         logger.debug(f"Deleted chat session {session_id} for user {user_id}")
         return True
@@ -128,7 +141,7 @@ def delete_session(user_id: int, session_id: int) -> bool:
 
 def delete_all_sessions(user_id: int) -> int:
     """
-    Delete all chat sessions for a user.
+    Delete all chat sessions for a user and terminate their Temporal workflows.
     
     Args:
         user_id: User ID
@@ -136,7 +149,23 @@ def delete_all_sessions(user_id: int) -> int:
     Returns:
         Number of sessions deleted
     """
-    deleted_count = ChatSession.objects.filter(user_id=user_id).count()
+    # Get session IDs before deletion
+    session_ids = list(ChatSession.objects.filter(user_id=user_id).values_list('id', flat=True))
+    deleted_count = len(session_ids)
+    
+    # Terminate all workflows for this user
+    try:
+        from asgiref.sync import async_to_sync
+        from app.agents.temporal.workflow_manager import terminate_all_workflows_for_user
+        
+        # Use async_to_sync instead of creating new event loop
+        # This avoids "Future attached to different loop" errors
+        async_to_sync(terminate_all_workflows_for_user)(user_id)
+    except Exception as e:
+        logger.warning(f"Failed to terminate workflows for user {user_id}: {e}")
+        # Continue with deletion even if workflow termination fails
+    
+    # Delete all sessions
     ChatSession.objects.filter(user_id=user_id).delete()
     logger.debug(f"Deleted {deleted_count} chat sessions for user {user_id}")
     return deleted_count

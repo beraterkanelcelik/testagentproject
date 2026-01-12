@@ -79,6 +79,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'app.wsgi.application'
+ASGI_APPLICATION = 'app.asgi.application'
 
 
 # Database
@@ -201,3 +202,11 @@ PDF_OCR_MIN_TEXT_THRESHOLD = int(os.getenv('PDF_OCR_MIN_TEXT_THRESHOLD', '50')) 
 RAG_CHUNKING_STRATEGY = os.getenv('RAG_CHUNKING_STRATEGY', 'recursive')  # recursive, semantic
 RAG_TOKEN_COUNTING_METHOD = os.getenv('RAG_TOKEN_COUNTING_METHOD', 'tiktoken')  # tiktoken, estimation
 RAG_TOKENIZER_MODEL = os.getenv('RAG_TOKENIZER_MODEL', 'gpt-4o-mini')  # Model for tiktoken encoding
+
+# Redis Configuration
+REDIS_URL = os.getenv('REDIS_URL', 'redis://redis:6379')
+REDIS_PASSWORD = os.getenv('REDIS_AUTH', 'myredissecret')
+
+# Temporal Configuration
+TEMPORAL_ADDRESS = os.getenv('TEMPORAL_ADDRESS', 'temporal:7233')
+TEMPORAL_TASK_QUEUE = os.getenv('TEMPORAL_TASK_QUEUE', 'chat-queue')

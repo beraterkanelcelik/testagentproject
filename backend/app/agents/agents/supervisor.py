@@ -45,8 +45,12 @@ Consider:
 - User intent and what they're asking for
 - Whether this is a first message or help request (→ greeter)
 - Whether user wants to search documents or ask questions about their uploaded files (→ search)
+- Questions about people, entities, facts, or information that might be in documents (→ search)
+- "Who is X?", "What is X?", "Tell me about X" type questions (→ search)
 - Whether it's email-related (→ gmail)
 - If unclear, route to greeter for guidance
+
+IMPORTANT: Questions asking about specific people, entities, or facts (e.g., "who is X?", "what is X?", "tell me about X") should be routed to the search agent, as they likely need to search through uploaded documents.
 
 Respond with ONLY the agent name (e.g., "greeter", "search", or "gmail"). Do not include any other text."""
     
@@ -62,6 +66,26 @@ Respond with ONLY the agent name (e.g., "greeter", "search", or "gmail"). Do not
             Agent name to route to
         """
         try:
+            # Get the latest user message for keyword-based routing
+            latest_message = None
+            if messages:
+                # Find the last HumanMessage
+                for msg in reversed(messages):
+                    if hasattr(msg, 'content') and msg.content:
+                        latest_message = msg.content.lower().strip()
+                        break
+            
+            # Explicit keyword-based routing for common search queries
+            # This ensures questions about people/entities route to search agent
+            if latest_message:
+                search_keywords = [
+                    "who is", "what is", "tell me about", "who are", "what are",
+                    "search for", "find information about", "look up", "information about"
+                ]
+                if any(latest_message.startswith(keyword) for keyword in search_keywords):
+                    logger.info(f"Keyword-based routing: routing '{latest_message[:50]}...' to search agent")
+                    return "search"
+            
             # Get routing decision from LLM
             # Pass through config (including callbacks) from LangGraph
             response = self.invoke(messages, **kwargs)
@@ -72,7 +96,7 @@ Respond with ONLY the agent name (e.g., "greeter", "search", or "gmail"). Do not
                 return "greeter"
             
             agent_name = response.content.strip().lower()
-            logger.debug(f"Supervisor routing decision: '{agent_name}'")
+            logger.info(f"Supervisor routing decision: '{agent_name}' for message: '{latest_message[:50] if latest_message else 'N/A'}...'")
             
             # Handle None or empty string
             if not agent_name or agent_name == "none":

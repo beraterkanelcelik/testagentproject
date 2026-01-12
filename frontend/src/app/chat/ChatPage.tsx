@@ -175,13 +175,15 @@ export default function ChatPage() {
     setSending(true)
 
     // Add user message immediately
+    const tempUserMessageId = Date.now()
     const userMessage = {
-      id: Date.now(),
+      id: tempUserMessageId,
       role: 'user' as const,
       content,
       tokens_used: 0,
       created_at: new Date().toISOString(),
     }
+    console.log(`[FRONTEND] Created temporary user message temp_id=${tempUserMessageId} session=${currentSession.id} content_preview=${content.substring(0, 50)}...`)
     set((state: { messages: Message[] }) => ({
       messages: [...state.messages, userMessage],
     }))
@@ -203,6 +205,7 @@ export default function ChatPage() {
         
         // Create streaming message placeholder
         const assistantMessageId = Date.now() + 1
+        console.log(`[FRONTEND] Created temporary assistant message temp_id=${assistantMessageId} session=${currentSession.id}`)
         setWaitingForResponse(true)
         setWaitingMessageId(assistantMessageId)
         // Reset stream complete flag for this new message
@@ -228,12 +231,60 @@ export default function ChatPage() {
         }))
 
         // Use streaming
+        let tokenBatchCount = 0
+        let lastTokenLogTime = Date.now()
+        const streamStartTime = Date.now()
+        const eventTypeCounts: Record<string, number> = {}
+        
+        console.log(`[FRONTEND] Starting stream for session=${currentSession.id} message_preview=${content.substring(0, 50)}...`)
+        
         const stream = createAgentStream(
           currentSession.id,
           content,
           token,
           (event: StreamEvent) => {
-            if (event.type === 'token') {
+            const eventType = event.type as string
+            eventTypeCounts[eventType] = (eventTypeCounts[eventType] || 0) + 1
+            
+            // Handle message_saved event to update temporary IDs with real DB IDs
+            if (eventType === 'message_saved') {
+              const savedData = event.data || {}
+              const role = savedData.role
+              const dbId = savedData.db_id
+              const sessionId = savedData.session_id
+              
+              if (sessionId === currentSession.id && dbId) {
+                console.log(`[FRONTEND] Updating temporary message with db_id=${dbId} role=${role} session=${sessionId}`)
+                
+                set((state: { messages: Message[] }) => {
+                  // Find temporary message by role and update its ID
+                  // For user messages, find the most recent user message with a temporary ID
+                  // For assistant messages, find the message with the temporary assistantMessageId
+                  const updatedMessages = state.messages.map((msg: Message) => {
+                    if (role === 'user' && msg.role === 'user' && msg.id === tempUserMessageId) {
+                      console.log(`[FRONTEND] Updating user message temp_id=${tempUserMessageId} -> db_id=${dbId}`)
+                      return { ...msg, id: dbId }
+                    } else if (role === 'assistant' && msg.role === 'assistant' && msg.id === assistantMessageId) {
+                      console.log(`[FRONTEND] Updating assistant message temp_id=${assistantMessageId} -> db_id=${dbId}`)
+                      return { ...msg, id: dbId }
+                    }
+                    return msg
+                  })
+                  
+                  return { messages: updatedMessages }
+                })
+              }
+              return // Don't process message_saved as a regular event
+            }
+            
+            if (eventType === 'token') {
+              tokenBatchCount++
+              const now = Date.now()
+              // Log token batches every 10 tokens or every 500ms, whichever comes first
+              if (tokenBatchCount % 10 === 0 || (now - lastTokenLogTime) > 500) {
+                console.log(`[FRONTEND] Processing tokens: batch=${tokenBatchCount} session=${currentSession.id}`)
+                lastTokenLogTime = now
+              }
               // First token received, hide loading indicator
               setWaitingForResponse(false)
               setWaitingMessageId(null)
@@ -247,7 +298,8 @@ export default function ChatPage() {
                 }
                 
                 const currentContent = currentMessage.content || ''
-                const newContent = currentContent + event.data
+                const tokenData = event.data || ''
+                const newContent = currentContent + tokenData
                 
                 return {
                   messages: state.messages.map((msg: Message) =>
@@ -262,9 +314,10 @@ export default function ChatPage() {
                   ),
                 }
               })
-            } else if (event.type === 'update') {
+            } else if (eventType === 'update') {
               // Handle workflow state updates (agent_name, tool_calls, plan_proposal, status, etc.)
               const updateData = event.data || {}
+              console.log(`[FRONTEND] Received update event session=${currentSession.id} task=${updateData.task || 'none'} status=${updateData.status || 'none'}`)
               
               // Handle task status updates - create/update system status messages in real-time
               if (updateData.task && updateData.status) {
@@ -377,10 +430,15 @@ export default function ChatPage() {
                   ),
                 }
               })
-            } else if (event.type === 'done') {
+            } else if (eventType === 'done') {
               // Handle completion event with final data
               // tool_calls are sent via update event (before done event), we just mark stream as complete
               const doneData = event.data || {}
+              const duration = Date.now() - streamStartTime
+              const eventSummary = Object.entries(eventTypeCounts)
+                .map(([type, count]) => `${type}=${count}`)
+                .join(', ')
+              console.log(`[FRONTEND] Stream completed session=${currentSession.id} duration=${duration}ms tokens=${tokenBatchCount} events={${eventSummary}}`)
               
               // Mark stream as complete for this message - tool items can now be shown
               // tool_calls should already be set via update event, we just need to show them
@@ -438,20 +496,23 @@ export default function ChatPage() {
                   })
                 }
               })
-            } else if (event.type === 'error') {
-              console.error('[ChatPage] Error event received:', {
-                error: event.data?.error,
-                fullData: event.data,
-                assistantMessageId
-              })
+            } else if (eventType === 'error') {
+              const errorData = event.data || {}
+              const duration = Date.now() - streamStartTime
+              console.error(`[FRONTEND] Error event received session=${currentSession.id} duration=${duration}ms error=${errorData.error || 'unknown'}`)
               
-              toast.error(event.data?.error || 'Streaming error occurred')
+              toast.error(errorData.error || 'Streaming error occurred')
               setSending(false)
               setWaitingForResponse(false)
               setWaitingMessageId(null)
+            } else {
+              // Handle unknown event types gracefully
+              console.debug(`[FRONTEND] Unknown event type received session=${currentSession.id} type=${eventType}`, event)
             }
           },
           (error: Error) => {
+            const duration = Date.now() - streamStartTime
+            console.error(`[FRONTEND] Stream connection error session=${currentSession.id} duration=${duration}ms error=${error.message}`)
             toast.error(error.message || 'Streaming connection error')
             setSending(false)
             setWaitingForResponse(false)
@@ -462,6 +523,11 @@ export default function ChatPage() {
             // All data (content, tool_calls, agent_name, metadata) comes from the stream
             // Status messages are ephemeral and already updated in real-time
             // The assistant message is already complete with all metadata from update events
+            const duration = Date.now() - streamStartTime
+            const eventSummary = Object.entries(eventTypeCounts)
+              .map(([type, count]) => `${type}=${count}`)
+              .join(', ')
+            console.log(`[FRONTEND] Stream handler completed session=${currentSession.id} duration=${duration}ms tokens=${tokenBatchCount} events={${eventSummary}}`)
             
             setSending(false)
             setWaitingForResponse(false)
@@ -821,7 +887,8 @@ export default function ChatPage() {
               set((state: { messages: Message[] }) => {
                 const currentMessage = state.messages.find((msg: Message) => msg.id === executionMessageId)
                 const currentContent = currentMessage?.content || ''
-                const newContent = currentContent + event.data
+                const tokenData = event.data || ''
+                const newContent = currentContent + tokenData
                 
                 return {
                   messages: state.messages.map((msg: Message) =>

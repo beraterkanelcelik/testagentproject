@@ -1,12 +1,14 @@
 """
 Health check endpoint.
 """
+import os
 from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
 from django.db import connection
 from django.core.cache import cache
 from app.observability.tracing import get_langfuse_client
 from app.core.config import LANGFUSE_ENABLED
+from app.settings import TEMPORAL_ADDRESS
 
 
 @require_http_methods(["GET"])
@@ -99,6 +101,58 @@ def health_check(request):
         services["langfuse"] = {
             "status": "degraded",
             "message": "Langfuse is disabled"
+        }
+    
+    # Check Temporal (optional, won't fail if not configured)
+    if TEMPORAL_ADDRESS:
+        try:
+            import socket
+            from urllib.parse import urlparse
+            
+            # Parse Temporal address (e.g., "temporal:7233" or "localhost:7233")
+            # Handle both with and without protocol
+            address = TEMPORAL_ADDRESS.replace('http://', '').replace('https://', '')
+            if ':' in address:
+                host, port_str = address.rsplit(':', 1)
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    port = 7233
+            else:
+                host = address
+                port = 7233
+            
+            # Try to connect to Temporal server
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            
+            if result == 0:
+                services["temporal"] = {
+                    "status": "healthy",
+                    "message": f"Temporal server reachable at {host}:{port}"
+                }
+            else:
+                services["temporal"] = {
+                    "status": "unhealthy",
+                    "message": f"Temporal server at {host}:{port} is not reachable"
+                }
+                # Don't fail overall status for Temporal (it's optional for now)
+        except socket.gaierror as e:
+            services["temporal"] = {
+                "status": "degraded",
+                "message": f"Temporal hostname resolution failed: {str(e)}"
+            }
+        except Exception as e:
+            services["temporal"] = {
+                "status": "degraded",
+                "message": f"Temporal check failed: {str(e)}"
+            }
+    else:
+        services["temporal"] = {
+            "status": "degraded",
+            "message": "Temporal is not configured"
         }
     
     return JsonResponse({

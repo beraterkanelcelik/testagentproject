@@ -22,7 +22,9 @@ langfuse>=3.0.0
 # Environment variable management
 python-dotenv>=1.0.0
 
-# ASGI server for production
+# ASGI server for async views (development and production)
+uvicorn[standard]>=0.24.0
+# WSGI server for production (if needed for sync-only deployments)
 gunicorn>=21.2.0
 
 # REST Framework
@@ -51,3 +53,9 @@ pgvector>=0.2.0
 
 # Reranking
 cohere>=4.0.0
+
+# Temporal for workflow orchestration
+temporalio>=1.8.0
+
+# Redis for pub/sub streaming
+redis>=5.0.0

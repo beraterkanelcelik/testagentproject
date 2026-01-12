@@ -86,6 +86,11 @@ def chat_session_detail(request, session_id):
                 status=404
             )
         
+        # NOTE: Don't create workflow here - workflows should only be created when there's
+        # an actual message to process. Creating it here would send an empty signal and cause
+        # duplicate processing when the user sends their first message.
+        # Workflow will be created automatically when stream_agent is called with a message.
+        
         return JsonResponse({
             'id': session.id,
             'title': session.title,

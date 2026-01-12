@@ -15,6 +15,7 @@ class AgentRequest(BaseModel):
     app_roles: List[str] = []
     flow: str = "main"  # main, direct, plan
     plan_steps: Optional[List[Dict[str, Any]]] = None  # For plan execution
+    trace_id: Optional[str] = None  # Langfuse trace ID for tracing
 
 
 class ToolProposal(BaseModel):

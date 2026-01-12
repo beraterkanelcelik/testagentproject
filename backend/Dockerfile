@@ -36,4 +36,5 @@ RUN mkdir -p /app/staticfiles
 EXPOSE 8000
 
 # Default command (can be overridden in docker-compose)
-CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+# Use uvicorn for ASGI support (required for async views)
+CMD ["uvicorn", "app.asgi:application", "--host", "0.0.0.0", "--port", "8000"]
