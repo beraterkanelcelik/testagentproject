@@ -17,6 +17,8 @@ class AgentRequest(BaseModel):
     plan_steps: Optional[List[Dict[str, Any]]] = None  # For plan execution
     trace_id: Optional[str] = None  # Langfuse trace ID for tracing
     approved_tool_results: Optional[Dict[str, Any]] = None  # Human-in-the-loop: approved tool results (tool_call_id -> result)
+    run_id: Optional[str] = None  # Correlation ID for /run polling (ensures correct message under concurrency)
+    parent_message_id: Optional[int] = None  # Parent user message ID for correlation
 
 
 class ToolProposal(BaseModel):

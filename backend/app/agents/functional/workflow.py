@@ -378,11 +378,15 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                     agent_name="system"
                 )
             current_user_id = None  # Can't get from Command, but may not be needed for resume
+            current_run_id = None  # Command resume: correlation IDs not available (not needed for resume)
+            current_parent_message_id = None
             logger.info(f"[HITL] [RESUME] Command resume - session_id={current_session_id}")
         else:
             # Initial run: get from AgentRequest
             current_session_id = request.session_id
             current_user_id = request.user_id
+            current_run_id = getattr(request, 'run_id', None)  # Correlation ID for /run polling
+            current_parent_message_id = getattr(request, 'parent_message_id', None)  # Parent message ID for correlation
         
         # CRITICAL: Always use the same thread_id format for both initial and resume
         # This ensures LangGraph uses the same checkpoint
@@ -594,7 +598,9 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                             ),
                             session_id=current_session_id,
                             user_id=current_user_id,
-                            tool_calls=response.tool_calls
+                            tool_calls=response.tool_calls,
+                            run_id=current_run_id,
+                            parent_message_id=current_parent_message_id
                         ).result()
                         logger.info(f"[HITL] [STORE] Stored assistant message with {len([tc for tc in response.tool_calls if tool_requires_approval(tc.get('name') or tc.get('tool', ''))])} tools awaiting approval session={current_session_id}")
                     except Exception as e:
@@ -829,7 +835,9 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                 response=response,
                 session_id=current_session_id,
                 user_id=current_user_id,
-                tool_calls=final_tool_calls  # Pass tool_calls with updated statuses
+                tool_calls=final_tool_calls,  # Pass tool_calls with updated statuses
+                run_id=current_run_id,
+                parent_message_id=current_parent_message_id
             ).result()
         
         # Update trace with final response
@@ -972,11 +980,14 @@ def _execute_plan_workflow(
                 if tool_results:
                     tool_result = tool_results[0]
                     
-                    # Store raw output
+                    # Import truncate function
+                    from app.agents.functional.tasks import truncate_tool_output
+                    
+                    # Store raw output (truncate large outputs)
                     raw_tool_outputs.append({
                         "tool": tool_result.tool,
                         "args": tool_result.args,
-                        "output": tool_result.output,
+                        "output": truncate_tool_output(tool_result.output),
                     })
                     
                     # Add tool result as ToolMessage
@@ -1016,7 +1027,9 @@ def _execute_plan_workflow(
                 response=final_response,
                 session_id=request.session_id,
                 user_id=request.user_id,
-                tool_calls=[]
+                tool_calls=[],
+                run_id=getattr(request, 'run_id', None),
+                parent_message_id=getattr(request, 'parent_message_id', None)
             ).result()
         
         # Update plan execution trace
@@ -1106,7 +1119,9 @@ async def ai_agent_workflow_events(request: Union[AgentRequest, Command], sessio
     }
     
     # Create thread-safe queue for events from callbacks
-    event_queue = ThreadQueue()
+    # Bound queue to prevent unbounded memory growth
+    MAX_QUEUE_SIZE = 10000  # ~10MB assuming 1KB per event
+    event_queue = ThreadQueue(maxsize=MAX_QUEUE_SIZE)
     
     # Create event callback handler for streaming
     callback_handler = EventCallbackHandler(event_queue, status_messages)

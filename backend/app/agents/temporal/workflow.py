@@ -3,7 +3,6 @@ Temporal workflow definitions for chat execution.
 Long-running workflow per chat session using signals.
 """
 import asyncio
-import hashlib
 from dataclasses import dataclass
 from datetime import timedelta
 from temporalio import workflow
@@ -61,9 +60,11 @@ class ChatWorkflow:
         self.processed_messages: set = set()
         # Track resume payload for interrupt resume (human-in-the-loop)
         self.resume_payload: Optional[Any] = None
+        # Store last activity result for query (non-stream mode)
+        self.last_activity_result: Optional[Dict[str, Any]] = None
     
     @workflow.signal
-    def new_message(self, message: str, plan_steps: Optional[list] = None, flow: str = "main") -> None:
+    def new_message(self, message: str, plan_steps: Optional[list] = None, flow: str = "main", mode: str = "stream", run_id: Optional[str] = None, parent_message_id: Optional[int] = None) -> None:
         """
         Signal handler for new messages.
         
@@ -71,26 +72,39 @@ class ChatWorkflow:
             message: Message content
             plan_steps: Optional plan steps
             flow: Flow type
+            mode: Execution mode - "stream" for streaming (SSE), "non_stream" for non-streaming (API)
+            run_id: Optional correlation ID for /run polling (ensures stable dedupe identity)
+            parent_message_id: Optional parent user message ID for correlation
         """
         if self.is_closing:
             workflow.logger.warning("Workflow is closing, ignoring new message signal")
             return
         
-        # Create message hash for deduplication (use message content + flow)
-        message_hash = hashlib.md5(f"{message}:{flow}".encode()).hexdigest()
+        # Create stable identity hash for deduplication (not content-based)
+        # Use run_id if available (most stable), otherwise parent_message_id, otherwise fallback to UUID
+        # This prevents collisions when same message text is sent via /stream then /run
+        if run_id:
+            message_hash = f"run:{run_id}"
+        elif parent_message_id:
+            message_hash = f"msg:{parent_message_id}"
+        else:
+            # Fallback: generate unique hash (shouldn't happen if API passes correlation IDs)
+            # Use workflow.uuid4() for determinism (required for Temporal workflow replay)
+            message_hash = f"fallback:{workflow.uuid4().hex[:16]}"
+            workflow.logger.warning(f"[DEDUPE] No run_id or parent_message_id provided, using fallback hash session={workflow.info().workflow_id}")
         
         # Check if message is already in queue or already processed
         message_in_queue = any(
-            hashlib.md5(f"{m.get('message', '')}:{m.get('flow', 'main')}".encode()).hexdigest() == message_hash
+            m.get("_hash") == message_hash
             for m in self.pending_messages
         )
         
         if message_in_queue:
-            workflow.logger.warning(f"[DUPLICATE_SIGNAL] Ignoring duplicate signal - message already in queue session={workflow.info().workflow_id} message_preview={message[:50]}...")
+            workflow.logger.warning(f"[DUPLICATE_SIGNAL] Ignoring duplicate signal - message already in queue session={workflow.info().workflow_id} hash={message_hash} message_preview={message[:50]}...")
             return
         
         if message_hash in self.processed_messages:
-            workflow.logger.warning(f"[DUPLICATE_SIGNAL] Ignoring duplicate signal - message already processed session={workflow.info().workflow_id} message_preview={message[:50]}...")
+            workflow.logger.warning(f"[DUPLICATE_SIGNAL] Ignoring duplicate signal - message already processed session={workflow.info().workflow_id} hash={message_hash} message_preview={message[:50]}...")
             return
         
         # Add message to queue
@@ -98,12 +112,15 @@ class ChatWorkflow:
             "message": message,
             "plan_steps": plan_steps,
             "flow": flow,
-            "_hash": message_hash,  # Store hash for later reference
+            "mode": mode,  # Execution mode: "stream" or "non_stream"
+            "run_id": run_id,  # Correlation ID
+            "parent_message_id": parent_message_id,  # Parent message ID
+            "_hash": message_hash,  # Store stable hash for deduplication
         }
         self.pending_messages.append(signal_data)
         # Update last activity time
         self.last_activity_time = workflow.now().timestamp()
-        workflow.logger.info(f"[SIGNAL_RECEIVE] Received message signal session={workflow.info().workflow_id} message_preview={message[:50]}... queue_size={len(self.pending_messages)}")
+        workflow.logger.info(f"[SIGNAL_RECEIVE] Received message signal session={workflow.info().workflow_id} hash={message_hash} message_preview={message[:50]}... queue_size={len(self.pending_messages)}")
     
     @workflow.signal
     def resume(self, resume_payload: Any) -> None:
@@ -137,6 +154,18 @@ class ChatWorkflow:
         self.resume_payload = enveloped_payload
         workflow.logger.info(f"[HITL] Received resume signal: session_id={chat_id}, resume_payload keys={list(enveloped_payload.keys())} session={workflow.info().workflow_id}")
         workflow.logger.info(f"[HITL] This signal will wake up wait_condition if workflow is waiting for resume session={workflow.info().workflow_id}")
+    
+    @workflow.query
+    def get_last_result(self) -> Optional[Dict[str, Any]]:
+        """
+        Query handler to get last activity result without waiting for workflow completion.
+        
+        Returns:
+            Dictionary with activity result including run_id, status, response, interrupt, error, timestamp
+            Returns None if no result is available yet
+        """
+        # Returns None if not set yet (handled by API polling loop)
+        return self.last_activity_result
     
     @workflow.run
     async def run(
@@ -216,6 +245,9 @@ class ChatWorkflow:
                     "message": message_content,
                     "plan_steps": signal_data.get("plan_steps"),
                     "flow": signal_data.get("flow", "main"),
+                    "mode": signal_data.get("mode", "stream"),  # Pass mode to activity
+                    "run_id": signal_data.get("run_id"),  # Pass correlation ID to activity
+                    "parent_message_id": signal_data.get("parent_message_id"),  # Pass parent message ID to activity
                     "tenant_id": tenant_id,  # Use user_id as fallback
                     "org_slug": self.initial_state.get("org_slug"),
                     "org_roles": self.initial_state.get("org_roles", []),
@@ -238,7 +270,7 @@ class ChatWorkflow:
                         # Maximum time for a single attempt
                         start_to_close_timeout=timedelta(minutes=10),
                         # Heartbeat timeout - activity must heartbeat within this interval
-                        heartbeat_timeout=timedelta(seconds=30),
+                        heartbeat_timeout=timedelta(seconds=60),  # Increased from 30s for slow LLM responses
                         # Retry policy for transient failures
                         retry_policy=RetryPolicy(
                             maximum_attempts=3,
@@ -295,7 +327,7 @@ class ChatWorkflow:
                                 activity_input_continue,
                                 schedule_to_close_timeout=timedelta(minutes=30),
                                 start_to_close_timeout=timedelta(minutes=10),
-                                heartbeat_timeout=timedelta(seconds=30),
+                                heartbeat_timeout=timedelta(seconds=60),  # Increased from 30s for slow LLM responses
                                 retry_policy=RetryPolicy(
                                     maximum_attempts=3,
                                     initial_interval=timedelta(seconds=1),
@@ -325,6 +357,18 @@ class ChatWorkflow:
                                 f"to prevent unbounded growth for session {chat_id}"
                             )
                             self.processed_messages.clear()
+                    
+                    # Store activity result with run_id for correlation (non-stream mode uses query)
+                    # This allows API to query workflow for result without waiting for completion
+                    self.last_activity_result = {
+                        "run_id": signal_data.get("run_id"),
+                        "status": result.get("status") if isinstance(result, dict) else "unknown",
+                        "response": result.get("response") if isinstance(result, dict) else None,
+                        "interrupt": result.get("interrupt") if isinstance(result, dict) else None,
+                        "error": result.get("error") if isinstance(result, dict) else None,
+                        "timestamp": workflow.now().timestamp(),
+                    }
+                    workflow.logger.info(f"[WORKFLOW] Stored activity result for query: run_id={signal_data.get('run_id')}, status={self.last_activity_result['status']} session={chat_id}")
                     
                     # Update last activity time after successful processing
                     self.last_activity_time = workflow.now().timestamp()

@@ -64,8 +64,11 @@ export default function ChatPage() {
   const [renameSessionId, setRenameSessionId] = useState<number | null>(null)
   const [renameSessionTitle, setRenameSessionTitle] = useState<string>('')
   const [executingPlanMessageId, setExecutingPlanMessageId] = useState<number | null>(null)
+  const [approvingToolCalls, setApprovingToolCalls] = useState<Set<string>>(new Set()) // Track which tool calls are being approved
+  const processedInterruptsRef = useRef<Set<string>>(new Set()) // Track processed interrupts to prevent duplicates
   const fileInputRef = useRef<HTMLInputElement>(null)
   const streamRef = useRef<ReturnType<typeof createAgentStream> | null>(null)
+  const pollIntervalRef = useRef<number | null>(null)
   const initialMessageSentRef = useRef(false)
   const initialMessageRef = useRef<string | null>(null)
 
@@ -211,6 +214,11 @@ export default function ChatPage() {
       }
 
       if (useStreaming) {
+        // Clear processed interrupts for new message stream
+        processedInterruptsRef.current.clear()
+        // Also clear any stale approving states from previous message
+        setApprovingToolCalls(new Set())
+        
         // Clear any old temporary status messages before starting a new stream
         // They are ephemeral and should not persist across different streams
         set((state: { messages: Message[] }) => ({
@@ -648,6 +656,17 @@ export default function ChatPage() {
               
               if (interruptValue && interruptValue.type === 'tool_approval') {
                 const tools = interruptValue.tools || []
+                
+                // Generate unique interrupt ID from tools to prevent duplicate processing
+                const interruptId = JSON.stringify(tools.map((t: any) => t.tool_call_id || t.id).sort())
+                
+                // Deduplicate - prevent processing same interrupt twice
+                if (processedInterruptsRef.current.has(interruptId)) {
+                  console.log(`[HITL] [INTERRUPT] Ignoring duplicate interrupt: interruptId=${interruptId} session=${currentSession.id}`)
+                  return
+                }
+                processedInterruptsRef.current.add(interruptId)
+                
                 console.log(`[HITL] [INTERRUPT] Received interrupt with ${tools.length} tools requiring approval:`, tools.map((t: any) => ({ tool: t.tool, tool_call_id: t.tool_call_id })))
                 
                 // Mark message as ready to show tool calls (even though stream isn't complete)
@@ -780,41 +799,139 @@ export default function ChatPage() {
         // Use non-streaming (regular API call via agent.runAgent)
         setWaitingForResponse(true)
         setWaitingMessageId(null)
+        
+        // Clear any existing polling interval
+        if (pollIntervalRef.current) {
+          clearInterval(pollIntervalRef.current)
+          pollIntervalRef.current = null
+        }
+        
         try {
           const response = await agentAPI.runAgent({
             chat_session_id: currentSession.id,
             message: content,
           })
           
-          // Check if response contains plan_proposal
-          if (response.data?.type === 'plan_proposal' && response.data?.plan) {
-            // Update the assistant message with plan proposal
-            set((state: { messages: Message[] }) => {
-              const lastMessage = state.messages[state.messages.length - 1]
-              if (lastMessage && lastMessage.role === 'assistant') {
-                return {
-                  messages: state.messages.map((msg: Message) =>
-                    msg.id === lastMessage.id
-                      ? {
-                          ...msg,
-                          response_type: 'plan_proposal',
-                          plan: response.data.plan,
-                          metadata: {
-                            ...msg.metadata,
-                            agent_name: response.data.agent_name || msg.metadata?.agent_name,
-                          },
-                        }
-                      : msg
-                  ),
+          // Handle different response statuses
+          if (response.status === 200 && response.data?.status === 'completed') {
+            // Fast completion - response is ready
+            // Check if response contains plan_proposal
+            if (response.data?.type === 'plan_proposal' && response.data?.plan) {
+              // Update the assistant message with plan proposal
+              set((state: { messages: Message[] }) => {
+                const lastMessage = state.messages[state.messages.length - 1]
+                if (lastMessage && lastMessage.role === 'assistant') {
+                  return {
+                    messages: state.messages.map((msg: Message) =>
+                      msg.id === lastMessage.id
+                        ? {
+                            ...msg,
+                            response_type: 'plan_proposal',
+                            plan: response.data.plan,
+                            metadata: {
+                              ...msg.metadata,
+                              agent_name: response.data.agent_name || msg.metadata?.agent_name,
+                            },
+                          }
+                        : msg
+                    ),
+                  }
                 }
-              }
-              return state
-            })
+                return state
+              })
+            }
+            
+            // Reload messages to get both user and assistant messages from backend
+            await loadMessages(currentSession.id)
+            setSending(false)
+            setWaitingForResponse(false)
+            setWaitingMessageId(null)
+          } else if (response.status === 202) {
+            // Still processing or approval required
+            const status = response.data?.status
+            
+            if (status === 'approval_required') {
+              // HITL - show approval UI
+              const interruptData = response.data?.interrupt
+              toast.info('Tool approval required')
+              
+              // Reload messages to get the interrupt state (message with awaiting_approval tools)
+              await loadMessages(currentSession.id)
+              
+              // The approval UI should appear automatically when messages are reloaded
+              // because the assistant message will have tool_calls with status="awaiting_approval"
+              setSending(false)
+              setWaitingForResponse(false)
+              setWaitingMessageId(null)
+            } else if (status === 'running') {
+              // Still processing - poll for completion
+              // Poll for completion (max 60 seconds, every 1 second)
+              const maxPollAttempts = 60
+              let pollAttempts = 0
+              
+              pollIntervalRef.current = setInterval(async () => {
+                pollAttempts++
+                
+                try {
+                  // Reload messages to check if assistant message is ready
+                  await loadMessages(currentSession.id)
+                  
+                  // Check if we have a new assistant message (after the user message we just sent)
+                  // After loadMessages, the store will update and component will re-render
+                  // We can check messages from the store on the next render cycle
+                  // For now, just rely on the natural UI update from loadMessages
+                  const lastUserMsg = messages.filter(m => m.role === 'user').slice(-1)[0]
+                  const lastAssistantMsg = messages.filter(m => m.role === 'assistant').slice(-1)[0]
+                  
+                  // If we have an assistant message that was created after the user message, we're done
+                  if (lastAssistantMsg && lastUserMsg && 
+                      new Date(lastAssistantMsg.created_at) > new Date(lastUserMsg.created_at)) {
+                    if (pollIntervalRef.current) {
+                      clearInterval(pollIntervalRef.current)
+                      pollIntervalRef.current = null
+                    }
+                    setSending(false)
+                    setWaitingForResponse(false)
+                    setWaitingMessageId(null)
+                  } else if (pollAttempts >= maxPollAttempts) {
+                    // Timeout - stop polling but keep waiting indicator
+                    if (pollIntervalRef.current) {
+                      clearInterval(pollIntervalRef.current)
+                      pollIntervalRef.current = null
+                    }
+                    toast.info('Response is still processing. Messages will appear when ready.')
+                    setSending(false)
+                    setWaitingForResponse(false)
+                    setWaitingMessageId(null)
+                  }
+                } catch (error) {
+                  console.error('Error polling for messages:', error)
+                  // Continue polling on error
+                }
+              }, 1000) // Poll every 1 second
+              
+              // Don't set sending/waiting to false here - let polling handle it
+            } else {
+              // Unknown status - just reload messages
+              await loadMessages(currentSession.id)
+              setSending(false)
+              setWaitingForResponse(false)
+              setWaitingMessageId(null)
+            }
+          } else {
+            // Unexpected response - reload messages anyway
+            await loadMessages(currentSession.id)
+            setSending(false)
+            setWaitingForResponse(false)
+            setWaitingMessageId(null)
           }
-          
-          // Reload messages to get both user and assistant messages from backend
-          loadMessages(currentSession.id)
-        } finally {
+        } catch (error: unknown) {
+          // Clean up polling if it was started
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current)
+            pollIntervalRef.current = null
+          }
+          toast.error(getErrorMessage(error, 'Failed to send message'))
           setSending(false)
           setWaitingForResponse(false)
           setWaitingMessageId(null)
@@ -825,6 +942,16 @@ export default function ChatPage() {
       setSending(false)
     }
   }, [currentSession, sending, useStreaming, loadMessages])
+
+  // Cleanup polling interval on unmount
+  useEffect(() => {
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current)
+        pollIntervalRef.current = null
+      }
+    }
+  }, [])
 
   // Handle initial message from navigation state - only once when session is loaded
   useEffect(() => {
@@ -1991,8 +2118,10 @@ export default function ChatPage() {
                                                 {/* Human-in-the-Loop Tool Review (aligned with LangGraph best practices) */}
                                                 {/* Reference: https://docs.langchain.com/oss/python/langgraph/use-functional-api#review-tool-calls */}
                                                 {(() => {
-                                                  const shouldShowReview = toolCall.status === 'pending' && toolCall.requires_approval === true && !!currentSession
-                                                  if (toolCall.status === 'pending') {
+                                                  // Show approval UI for tools with status="awaiting_approval" (from interrupt) or status="pending" (legacy)
+                                                  const isAwaitingApproval = toolCall.status === 'awaiting_approval' || toolCall.status === 'pending'
+                                                  const shouldShowReview = isAwaitingApproval && (toolCall.requires_approval === true || toolCall.status === 'awaiting_approval') && !!currentSession
+                                                  if (isAwaitingApproval) {
                                                     console.log(`[HITL] [REVIEW] Tool call review check: tool=${toolName} status=${toolCall.status} requires_approval=${toolCall.requires_approval} has_requires_approval=${'requires_approval' in toolCall} currentSession=${!!currentSession} shouldShowReview=${shouldShowReview}`)
                                                   }
                                                   return shouldShowReview
@@ -2006,14 +2135,64 @@ export default function ChatPage() {
                                                     </div>
                                                     <Button
                                                       size="sm"
+                                                      disabled={approvingToolCalls.has(toolCall.id || toolCallId)}
                                                       onClick={async () => {
-                                                        console.log(`[HITL] [REVIEW] User clicked Approve & Execute: tool=${toolName} tool_call_id=${toolCall.id || toolCallId} session=${currentSession?.id}`)
+                                                        const toolCallIdKey = toolCall.id || toolCallId
+                                                        
+                                                        // Prevent double-click
+                                                        if (approvingToolCalls.has(toolCallIdKey)) {
+                                                          console.log(`[HITL] [REVIEW] Approval already in progress for tool_call_id=${toolCallIdKey}, ignoring duplicate click`)
+                                                          return
+                                                        }
+                                                        
+                                                        console.log(`[HITL] [REVIEW] User clicked Approve & Execute: tool=${toolName} tool_call_id=${toolCallIdKey} session=${currentSession?.id}`)
+                                                        
+                                                        // Mark as approving immediately
+                                                        setApprovingToolCalls(prev => new Set(prev).add(toolCallIdKey))
+                                                        
+                                                        // Update tool status to 'approved' immediately (before API call)
+                                                        set((state: { messages: Message[] }) => ({
+                                                          messages: state.messages.map((m: Message) => {
+                                                            if (m.id === msg.id) {
+                                                              const toolCalls = m.metadata?.tool_calls || []
+                                                              const updatedToolCalls = toolCalls.map((tc: any, idx: number) => {
+                                                                const tcActualId = tc.id || `tool-${m.id}-${idx}`
+                                                                const tcComputedId = `tool-${m.id}-${idx}`
+                                                                const actualToolCallId = toolCall.id || toolCallId
+                                                                const matches = (
+                                                                  tcActualId === actualToolCallId ||
+                                                                  tcComputedId === toolCallId ||
+                                                                  (tc.id === toolCall.id && tc.name === toolName)
+                                                                )
+                                                                
+                                                                if (matches) {
+                                                                  console.log(`[HITL] [REVIEW] Updating tool call status immediately: tool_call_id=${tcActualId} from ${tc.status} to approved session=${currentSession?.id}`)
+                                                                  return {
+                                                                    ...tc,
+                                                                    status: 'approved',
+                                                                    requires_approval: false
+                                                                  }
+                                                                }
+                                                                return tc
+                                                              })
+                                                              return {
+                                                                ...m,
+                                                                metadata: {
+                                                                  ...m.metadata,
+                                                                  tool_calls: updatedToolCalls
+                                                                }
+                                                              }
+                                                            }
+                                                            return m
+                                                          })
+                                                        }))
+                                                        
                                                         try {
                                                           console.log(`[HITL] [REVIEW] Sending approval request: tool=${toolName} args=`, toolCall.args)
                                                           // Build resume payload with approval decision
                                                           const resumePayload = {
                                                             approvals: {
-                                                              [toolCall.id || toolCallId]: {
+                                                              [toolCallIdKey]: {
                                                                 approved: true,
                                                                 args: toolCall.args || {}
                                                               }
@@ -2028,7 +2207,7 @@ export default function ChatPage() {
                                                           console.log(`[HITL] [REVIEW] Approval response received: success=${response.data.success} session=${currentSession?.id}`)
                                                           
                                                           if (response.data.success) {
-                                                            console.log(`[HITL] [REVIEW] Tool approved and executed successfully: tool=${toolName} result_preview=${String(response.data.result || '').substring(0, 100)} session=${currentSession?.id}`)
+                                                            console.log(`[HITL] [REVIEW] Tool approved and executed successfully: tool=${toolName} result_preview=${String(response.data.response?.reply || '').substring(0, 100)} session=${currentSession?.id}`)
                                                             
                                                             // Update the tool call with the result (aligned with LangGraph Command pattern)
                                                             // This is equivalent to resuming with Command(resume=result) in LangGraph
@@ -2048,11 +2227,11 @@ export default function ChatPage() {
                                                                     )
                                                                     
                                                                     if (matches) {
-                                                                      console.log(`[HITL] [REVIEW] Updating tool call status: tool_call_id=${tcActualId} (matched by ${tcActualId === actualToolCallId ? 'actual ID' : tcComputedId === toolCallId ? 'computed ID' : 'name'}) from pending to completed session=${currentSession?.id}`)
+                                                                      console.log(`[HITL] [REVIEW] Updating tool call status: tool_call_id=${tcActualId} (matched by ${tcActualId === actualToolCallId ? 'actual ID' : tcComputedId === toolCallId ? 'computed ID' : 'name'}) from approved to completed session=${currentSession?.id}`)
                                                                       return {
                                                                         ...tc,
                                                                         status: 'completed',
-                                                                        result: response.data.result,
+                                                                        result: response.data.response?.reply || response.data.result,
                                                                         requires_approval: false
                                                                       }
                                                                     }
@@ -2069,21 +2248,167 @@ export default function ChatPage() {
                                                                 return m
                                                               })
                                                             }))
-                                                            toast.success('Tool executed successfully')
-                                                            // Note: SSE connection remains open (with shorter timeout) to receive final response
-                                                            // The workflow will resume and stream the final response on the same connection
+                                                            toast.success('Tool approved - executing...')
+                                                            
+                                                            // In stream mode, the existing SSE connection will receive the final/done events
+                                                            // The stream handlers already update messages, so we don't need to poll DB
+                                                            // In non-stream mode, we need to poll DB to get the final response
+                                                            if (useStreaming) {
+                                                              console.log(`[HITL] [REVIEW] Tool approved in stream mode - waiting for SSE stream to deliver final response session=${currentSession.id}`)
+                                                              
+                                                              // Clear approving state - the stream will deliver the response
+                                                              // The 'done' and 'final' event handlers already update the messages
+                                                              setApprovingToolCalls(prev => {
+                                                                const next = new Set(prev)
+                                                                next.delete(toolCallIdKey)
+                                                                return next
+                                                              })
+                                                              
+                                                              // Don't poll DB - the stream will deliver the response
+                                                              // The existing SSE connection is still open and will receive:
+                                                              // - token events (streaming tokens)
+                                                              // - done/final events (final response)
+                                                            } else {
+                                                              // Non-stream mode: we already have the response from the approval API!
+                                                              // The response.data.response contains the final reply
+                                                              console.log(`[HITL] [REVIEW] Tool approved in non-stream mode - response already received session=${currentSession.id}`)
+                                                              
+                                                              // Update the message with the final response we got from the approval API
+                                                              // This prevents DB polling from overwriting our local state with stale data
+                                                              if (response.data.response?.reply) {
+                                                                // Find the tool call message and add the final response
+                                                                set((state: { messages: Message[] }) => {
+                                                                  const toolMsgIndex = state.messages.findIndex((m: Message) => m.id === msg.id)
+                                                                  
+                                                                  if (toolMsgIndex < 0) {
+                                                                    return state // Tool message not found
+                                                                  }
+                                                                  
+                                                                  // Check if we already have a response message after the tool call
+                                                                  const hasResponseAfter = state.messages.slice(toolMsgIndex + 1).some((m: Message) => 
+                                                                    m.role === 'assistant' && m.content && m.content.trim().length > 0
+                                                                  )
+                                                                  
+                                                                  if (hasResponseAfter) {
+                                                                    // Response already exists, just update tool call status
+                                                                    return {
+                                                                      messages: state.messages.map((m: Message) => {
+                                                                        if (m.id === msg.id) {
+                                                                          const toolCalls = m.metadata?.tool_calls || []
+                                                                          const updatedToolCalls = toolCalls.map((tc: any) => {
+                                                                            const tcActualId = tc.id || `tool-${m.id}-${toolCalls.indexOf(tc)}`
+                                                                            const actualToolCallId = toolCall.id || toolCallId
+                                                                            if (tcActualId === actualToolCallId || tc.id === toolCall.id) {
+                                                                              return {
+                                                                                ...tc,
+                                                                                status: 'completed',
+                                                                                requires_approval: false
+                                                                              }
+                                                                            }
+                                                                            return tc
+                                                                          })
+                                                                          return {
+                                                                            ...m,
+                                                                            metadata: {
+                                                                              ...m.metadata,
+                                                                              tool_calls: updatedToolCalls
+                                                                            }
+                                                                          }
+                                                                        }
+                                                                        return m
+                                                                      })
+                                                                    }
+                                                                  }
+                                                                  
+                                                                  // Add the final response as a new assistant message
+                                                                  const newMessage: Message = {
+                                                                    id: Date.now(),
+                                                                    role: 'assistant',
+                                                                    content: response.data.response.reply,
+                                                                    tokens_used: 0,
+                                                                    created_at: new Date().toISOString(),
+                                                                    metadata: {
+                                                                      agent_name: response.data.response.agent_name || 'search'
+                                                                    }
+                                                                  }
+                                                                  
+                                                                  return {
+                                                                    messages: [...state.messages, newMessage]
+                                                                  }
+                                                                })
+                                                              }
+                                                              
+                                                              // Clear approving state - no polling needed
+                                                              setApprovingToolCalls(prev => {
+                                                                const next = new Set(prev)
+                                                                next.delete(toolCallIdKey)
+                                                                return next
+                                                              })
+                                                              
+                                                              // Optionally reload messages once after a delay to sync with DB
+                                                              // This ensures we get the persisted message from the database
+                                                              setTimeout(async () => {
+                                                                try {
+                                                                  await loadMessages(currentSession.id)
+                                                                  // After loading, preserve the tool call status to prevent DB from overwriting
+                                                                  set((state: { messages: Message[] }) => ({
+                                                                    messages: state.messages.map((m: Message) => {
+                                                                      if (m.metadata?.tool_calls?.some((tc: any) => 
+                                                                        tc.id === toolCallIdKey || 
+                                                                        (tc.name === toolName && tc.status === 'awaiting_approval')
+                                                                      )) {
+                                                                        const toolCalls = m.metadata?.tool_calls || []
+                                                                        const updatedToolCalls = toolCalls.map((tc: any) => {
+                                                                          if (tc.id === toolCallIdKey || (tc.name === toolName && tc.status === 'awaiting_approval')) {
+                                                                            // Preserve completed status - don't let DB overwrite
+                                                                            return {
+                                                                              ...tc,
+                                                                              status: 'completed',
+                                                                              requires_approval: false
+                                                                            }
+                                                                          }
+                                                                          return tc
+                                                                        })
+                                                                        return {
+                                                                          ...m,
+                                                                          metadata: {
+                                                                            ...m.metadata,
+                                                                            tool_calls: updatedToolCalls
+                                                                          }
+                                                                        }
+                                                                      }
+                                                                      return m
+                                                                    })
+                                                                  }))
+                                                                } catch (error) {
+                                                                  console.error('Error syncing messages with DB:', error)
+                                                                }
+                                                              }, 2000) // Wait 2 seconds for backend to persist
+                                                            }
                                                           } else {
                                                             console.error(`[HITL] [REVIEW] Tool approval failed: error=${response.data.error} session=${currentSession?.id}`)
                                                             toast.error(response.data.error || 'Tool execution failed')
+                                                            // Clear approving state on failure
+                                                            setApprovingToolCalls(prev => {
+                                                              const next = new Set(prev)
+                                                              next.delete(toolCallIdKey)
+                                                              return next
+                                                            })
                                                           }
                                                         } catch (error: any) {
                                                           console.error(`[HITL] [REVIEW] Error approving tool:`, error, `session=${currentSession?.id}`)
                                                           toast.error(getErrorMessage(error, 'Failed to approve tool'))
+                                                          // Clear approving state on error
+                                                          setApprovingToolCalls(prev => {
+                                                            const next = new Set(prev)
+                                                            next.delete(toolCallIdKey)
+                                                            return next
+                                                          })
                                                         }
                                                       }}
                                                       className="h-7 text-xs bg-green-600 hover:bg-green-700 text-white"
                                                     >
-                                                      ✓ Approve & Execute
+                                                      {approvingToolCalls.has(toolCall.id || toolCallId) ? 'Approving...' : '✓ Approve & Execute'}
                                                     </Button>
                                                   </div>
                                                 )}

@@ -2,7 +2,7 @@
 Event callback handler for streaming LLM tokens and task events.
 """
 from typing import Dict, Any, List, Optional
-from queue import Queue
+from queue import Queue, Full as QueueFull
 from langchain_core.callbacks import BaseCallbackHandler
 from app.core.logging import get_logger
 
@@ -106,6 +106,10 @@ class EventCallbackHandler(BaseCallbackHandler):
                     "type": "token",
                     "value": token
                 })
+            except QueueFull:
+                # Queue is full - drop token to prevent unbounded memory growth
+                # Use debug level to avoid log spam under sustained load
+                logger.debug(f"Event queue full, dropping token")
             except Exception as e:
                 logger.error(f"[TOKEN_CALLBACK] Error queuing token: {e}", exc_info=True)
     
@@ -155,6 +159,8 @@ class EventCallbackHandler(BaseCallbackHandler):
                             "type": "update",
                             "data": {"status": status, "task": task_name}
                         })
+                    except QueueFull:
+                        logger.debug(f"Event queue full, dropping status update")
                     except Exception as e:
                         logger.debug(f"Error queuing status update: {e}")
         except Exception as e:
@@ -201,6 +207,8 @@ class EventCallbackHandler(BaseCallbackHandler):
                                             "is_completed": True
                                         }
                                     })
+                                except QueueFull:
+                                    logger.debug(f"Event queue full, dropping completion update")
                                 except Exception as e:
                                     logger.debug(f"Error queuing completion update: {e}")
                                 
@@ -230,6 +238,8 @@ class EventCallbackHandler(BaseCallbackHandler):
                         "type": "update",
                         "data": {"status": f"Executing {tool_name}...", "tool": tool_name}
                     })
+                except QueueFull:
+                    logger.debug(f"Event queue full, dropping tool start update")
                 except Exception as e:
                     logger.debug(f"Error queuing tool start: {e}")
         except Exception as e:
@@ -250,6 +260,8 @@ class EventCallbackHandler(BaseCallbackHandler):
                         "type": "update",
                         "data": {"status": f"Executed {tool_name}", "tool": tool_name}
                     })
+                except QueueFull:
+                    logger.debug(f"Event queue full, dropping tool end update")
                 except Exception as e:
                     logger.debug(f"Error queuing tool end: {e}")
         except Exception as e:

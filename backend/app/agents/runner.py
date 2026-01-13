@@ -22,6 +22,28 @@ if LANGCHAIN_TRACING_V2:
     os.environ['LANGCHAIN_PROJECT'] = LANGCHAIN_PROJECT
 
 
+def serialize_response(response: AgentResponse) -> Dict[str, Any]:
+    """
+    Serialize AgentResponse to dict for JSON transport.
+    
+    Args:
+        response: AgentResponse object or None
+        
+    Returns:
+        Dictionary representation of the response, or None if response is None
+    """
+    if response is None:
+        return None
+    if hasattr(response, 'model_dump'):
+        return response.model_dump()
+    elif hasattr(response, 'dict'):
+        return response.dict()
+    elif isinstance(response, dict):
+        return response
+    else:
+        return {"reply": str(response)}
+
+
 class AgentRunner:
     """
     Unified runner for agent execution that handles both streaming and non-streaming modes.
@@ -41,7 +63,9 @@ class AgentRunner:
         org_slug: Optional[str] = None,
         org_roles: Optional[List[str]] = None,
         app_roles: Optional[List[str]] = None,
-        resume_payload: Optional[Any] = None
+        resume_payload: Optional[Any] = None,
+        run_id: Optional[str] = None,
+        parent_message_id: Optional[int] = None
     ):
         """
         Initialize the agent runner.
@@ -93,6 +117,8 @@ class AgentRunner:
                 flow=flow,
                 plan_steps=plan_steps,
                 trace_id=self.trace_id,
+                run_id=run_id,
+                parent_message_id=parent_message_id,
             )
         
         # Prepare trace context
@@ -104,8 +130,35 @@ class AgentRunner:
                 metadata={
                     "chat_session_id": chat_session_id,
                     "trace_id": self.trace_id,
-                }
+            }
+        )
+    
+    async def execute(self) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Single execution pipeline - yields all events from ai_agent_workflow_events().
+        
+        This is the unified event source for both stream and non-stream modes.
+        The difference is only in how events are delivered (forwarded vs aggregated).
+        
+        Yields:
+            Event dictionaries with type and data
+        """
+        try:
+            async for event in ai_agent_workflow_events(
+                self.request,
+                session_id=self.chat_session_id,
+                user_id=self.user_id,
+                trace_id=self.trace_id
+            ):
+                yield event
+                if event.get("type") in ("final", "interrupt", "error"):
+                    return
+        except Exception as e:
+            logger.error(
+                f"Error in AgentRunner.execute for user {self.user_id}, session {self.chat_session_id}: {e}",
+                exc_info=True
             )
+            yield {"type": "error", "error": str(e)}
     
     async def run(self) -> AgentResponse:
         """
@@ -161,6 +214,112 @@ class AgentRunner:
             flush_traces()
         
         return final
+    
+    async def invoke(self) -> Dict[str, Any]:
+        """
+        Invoke workflow in non-streaming mode using LangGraph's .invoke() method.
+        
+        This method is used inside Temporal activity for non-stream mode.
+        It does not generate token events, eliminating streaming overhead.
+        
+        Returns:
+            Dictionary with status and response:
+            - {"status": "completed", "response": AgentResponse} on success
+            - {"status": "approval_required", "interrupt": {...}} on interrupt
+        """
+        from app.agents.functional.workflow import ai_agent_workflow
+        from app.agents.checkpoint import get_checkpoint_config
+        from langgraph.errors import GraphInterrupt
+        
+        try:
+            # Get checkpoint config for this session
+            checkpoint_config = get_checkpoint_config(self.chat_session_id)
+            
+            # Call workflow directly with .invoke() (no streaming, no token events)
+            # NOTE: When using .invoke(), interrupts are NOT raised as GraphInterrupt exceptions.
+            # Instead, the result contains __interrupt__ key when interrupt() is called.
+            # Reference: https://docs.langchain.com/oss/python/langgraph/interrupts
+            result = ai_agent_workflow.invoke(self.request, config=checkpoint_config)
+            
+            # Check if result contains __interrupt__ (LangGraph's way of surfacing interrupts in .invoke())
+            # When interrupt() is called, .invoke() returns a dict with __interrupt__ key instead of raising GraphInterrupt
+            if isinstance(result, dict) and "__interrupt__" in result:
+                interrupt_raw = result["__interrupt__"]
+                interrupt_data = None
+                
+                # Extract interrupt value from LangGraph Interrupt object
+                # LangGraph returns __interrupt__ as a tuple: (Interrupt(value={...}, id='...'),)
+                if isinstance(interrupt_raw, tuple) and len(interrupt_raw) > 0:
+                    interrupt_obj = interrupt_raw[0]
+                    if hasattr(interrupt_obj, 'value'):
+                        interrupt_data = interrupt_obj.value
+                    elif isinstance(interrupt_obj, dict):
+                        interrupt_data = interrupt_obj.get('value', interrupt_obj)
+                    else:
+                        interrupt_data = interrupt_obj
+                elif isinstance(interrupt_raw, dict):
+                    interrupt_data = interrupt_raw.get('value', interrupt_raw)
+                elif hasattr(interrupt_raw, 'value'):
+                    interrupt_data = interrupt_raw.value
+                else:
+                    interrupt_data = interrupt_raw
+                
+                logger.info(f"[HITL] [INVOKE] Workflow interrupted during invoke (via __interrupt__): session={self.chat_session_id}, interrupt_data={interrupt_data}")
+                
+                # Flush traces even on interrupt
+                if LANGFUSE_ENABLED:
+                    flush_traces()
+                
+                return {
+                    "status": "approval_required",
+                    "interrupt": interrupt_data or {"type": "tool_approval", "session_id": self.chat_session_id, "tools": []}
+                }
+            
+            # result is AgentResponse (normal completion)
+            if result:
+                # Flush traces if enabled
+                if LANGFUSE_ENABLED:
+                    flush_traces()
+                
+                return {
+                    "status": "completed",
+                    "response": result
+                }
+            else:
+                raise Exception("Workflow completed without response")
+                
+        except GraphInterrupt as e:
+            # GraphInterrupt can still be raised in some edge cases, handle it for safety
+            logger.info(f"[INVOKE] Caught GraphInterrupt exception: {type(e)}, has_value={hasattr(e, 'value')}, has_interrupt={hasattr(e, 'interrupt')}")
+            # Interrupt occurred - workflow paused for approval
+            # Extract interrupt data from the exception
+            interrupt_data = None
+            if hasattr(e, 'value'):
+                interrupt_data = e.value
+            elif hasattr(e, 'interrupt'):
+                interrupt_data = e.interrupt
+            
+            logger.info(f"[HITL] [INVOKE] Workflow interrupted during invoke (via exception): session={self.chat_session_id}")
+            
+            # Flush traces even on interrupt
+            if LANGFUSE_ENABLED:
+                flush_traces()
+            
+            return {
+                "status": "approval_required",
+                "interrupt": interrupt_data or {"type": "tool_approval", "session_id": self.chat_session_id, "tools": []}
+            }
+        except Exception as e:
+            logger.error(
+                f"Error in AgentRunner.invoke for user {self.user_id}, session {self.chat_session_id}: {e}",
+                exc_info=True
+            )
+            
+            # Flush traces even on error
+            if LANGFUSE_ENABLED:
+                flush_traces()
+            
+            raise
     
     async def stream(self, emit: Optional[Callable[[Dict[str, Any]], None]] = None) -> AsyncIterator[Dict[str, Any]]:
         """

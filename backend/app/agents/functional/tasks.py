@@ -23,6 +23,35 @@ supervisor_agent = SupervisorAgent()
 greeter_agent_cache = {}
 search_agent_cache = {}
 
+# Maximum size for tool outputs before truncation (50KB)
+MAX_TOOL_OUTPUT_SIZE = 50_000
+
+
+def truncate_tool_output(output: Any) -> Any:
+    """
+    Truncate large tool outputs to prevent unbounded memory growth.
+    
+    Args:
+        output: Tool output (any type)
+        
+    Returns:
+        Truncated output if too large, original output otherwise
+    """
+    try:
+        serialized = json.dumps(output, default=str)
+        if len(serialized) > MAX_TOOL_OUTPUT_SIZE:
+            return {
+                "truncated": True,
+                "preview": serialized[:1000],
+                "size": len(serialized),
+                "original_size": len(serialized)
+            }
+        return output
+    except Exception as e:
+        logger.warning(f"Error truncating tool output: {e}")
+        # If serialization fails, return a safe representation
+        return {"error": "Failed to serialize tool output", "type": str(type(output))}
+
 
 @task
 def supervisor_task(
@@ -793,7 +822,9 @@ def save_message_task(
     response: AgentResponse,
     session_id: int,
     user_id: int,
-    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+    run_id: Optional[str] = None,
+    parent_message_id: Optional[int] = None
 ) -> bool:
     """
     Save agent response message to database.
@@ -822,21 +853,34 @@ def save_message_task(
         
         # Ensure all tool_calls have status field for consistency
         # Status can be: 'pending', 'executing', 'completed', 'error'
+        # Also truncate large tool outputs
         for tc in final_tool_calls:
             if 'status' not in tc:
-                # If tool was executed (has output or error), mark as completed/error
+                # If tool was executed (has output or result), mark as completed/error
                 if tc.get('output') or tc.get('result'):
                     tc['status'] = 'completed'
                 elif tc.get('error'):
                     tc['status'] = 'error'
                 else:
                     tc['status'] = 'pending'
+            
+            # Truncate large outputs in tool_calls
+            if 'output' in tc and tc['output'] is not None:
+                tc['output'] = truncate_tool_output(tc['output'])
+            if 'result' in tc and tc['result'] is not None:
+                tc['result'] = truncate_tool_output(tc['result'])
         
         # Build comprehensive metadata with ALL display fields
         metadata = {
             "agent_name": response.agent_name or "greeter",  # For agent badge display
             "tool_calls": final_tool_calls,  # Tool calls with statuses
         }
+        
+        # Add correlation IDs for /run polling (ensures correct message under concurrency)
+        if run_id:
+            metadata["run_id"] = run_id
+        if parent_message_id:
+            metadata["parent_message_id"] = parent_message_id
         
         # Add response type and plan data if plan_proposal
         if response.type == "plan_proposal":
@@ -848,9 +892,10 @@ def save_message_task(
         if response.clarification:
             metadata["clarification"] = response.clarification
         
-        # Add raw tool outputs if present
+        # Add raw tool outputs if present (truncate large outputs)
         if response.raw_tool_outputs:
-            metadata["raw_tool_outputs"] = response.raw_tool_outputs
+            truncated_outputs = [truncate_tool_output(output) for output in response.raw_tool_outputs]
+            metadata["raw_tool_outputs"] = truncated_outputs
         
         # Add token usage to metadata
         if response.token_usage:

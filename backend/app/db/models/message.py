@@ -30,6 +30,11 @@ class Message(models.Model):
         ordering = ['created_at']
         verbose_name = 'Message'
         verbose_name_plural = 'Messages'
+        indexes = [
+            models.Index(fields=['session', 'role', '-created_at']),
+            # Note: JSON field indexes (e.g., metadata__run_id) require PostgreSQL
+            # and may need to be created via raw SQL migration for optimal performance
+        ]
     
     def __str__(self):
         return f"{self.role}: {self.content[:50]}..."

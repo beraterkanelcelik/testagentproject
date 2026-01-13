@@ -37,7 +37,8 @@ def get_workflow_id(user_id: int, session_id: int) -> str:
 async def get_or_create_workflow(
     user_id: int,
     session_id: int,
-    initial_state: Optional[Dict[str, Any]] = None
+    initial_state: Optional[Dict[str, Any]] = None,
+    mode: str = "stream"
 ) -> WorkflowHandle:
     """
     Get existing workflow or create new one for a chat session.
@@ -87,8 +88,11 @@ async def get_or_create_workflow(
                         # Temporal client operations should work across event loops
                         # Use asyncio.ensure_future to ensure it runs in current loop if needed
                         try:
-                            await handle.signal("new_message", args=(message, plan_steps, flow))
-                            logger.info(f"[SIGNAL_SEND] Sent message signal to existing workflow {workflow_id} session={session_id} message_preview={message[:50]}...")
+                            # Extract correlation IDs from initial_state for stable dedupe
+                            run_id = initial_state.get("run_id") if initial_state else None
+                            parent_message_id = initial_state.get("parent_message_id") if initial_state else None
+                            await handle.signal("new_message", args=(message, plan_steps, flow, mode, run_id, parent_message_id))
+                            logger.info(f"[SIGNAL_SEND] Sent message signal to existing workflow {workflow_id} session={session_id} mode={mode} run_id={run_id} message_preview={message[:50]}...")
                         except RuntimeError as loop_error:
                             error_str = str(loop_error)
                             if "different loop" in error_str or "attached to a different loop" in error_str or "Future" in error_str:
@@ -100,8 +104,10 @@ async def get_or_create_workflow(
                                 # Get a fresh client (should work in current loop)
                                 fresh_client = await get_temporal_client()
                                 fresh_handle = fresh_client.get_workflow_handle(workflow_id)
-                                await fresh_handle.signal("new_message", args=(message, plan_steps, flow))
-                                logger.info(f"[SIGNAL_SEND] Sent message signal via fresh client to workflow {workflow_id} session={session_id} message_preview={message[:50]}...")
+                                run_id = initial_state.get("run_id") if initial_state else None
+                                parent_message_id = initial_state.get("parent_message_id") if initial_state else None
+                                await fresh_handle.signal("new_message", args=(message, plan_steps, flow, mode, run_id, parent_message_id))
+                                logger.info(f"[SIGNAL_SEND] Sent message signal via fresh client to workflow {workflow_id} session={session_id} mode={mode} run_id={run_id} message_preview={message[:50]}...")
                             else:
                                 raise
                     except Exception as e:
@@ -140,8 +146,11 @@ async def get_or_create_workflow(
             logger.warning(f"[WORKFLOW_SKIP] Skipping workflow creation for session {session_id} - no message to process")
             raise ValueError(f"Cannot create workflow without a message for session {session_id}")
         
-        logger.info(f"Creating new workflow {workflow_id} with signal_with_start for session {session_id}")
+        logger.info(f"Creating new workflow {workflow_id} with signal_with_start for session {session_id} mode={mode}")
         try:
+            # Extract correlation IDs from initial_state for stable dedupe
+            run_id = initial_state.get("run_id") if initial_state else None
+            parent_message_id = initial_state.get("parent_message_id") if initial_state else None
             handle = await client.start_workflow(
                 ChatWorkflow.run,
                 args=(session_id, initial_state or {}),
@@ -149,11 +158,7 @@ async def get_or_create_workflow(
                 task_queue=TEMPORAL_TASK_QUEUE,
                 id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
                 start_signal="new_message",
-                start_signal_args=[
-                    message,
-                    plan_steps,
-                    flow,
-                ],
+                start_signal_args=(message, plan_steps, flow, mode, run_id, parent_message_id),
             )
         except Exception as create_error:
             # Workflow might have been created between our check and start_workflow call
@@ -164,8 +169,10 @@ async def get_or_create_workflow(
                 description = await handle.describe()
                 if description.status.name == "RUNNING":
                     # Workflow exists, send signal
-                    await handle.signal("new_message", args=(message, plan_steps, flow))
-                    logger.info(f"[SIGNAL_SEND] Sent message signal to existing workflow {workflow_id} session={session_id} message_preview={message[:50]}...")
+                    run_id = initial_state.get("run_id") if initial_state else None
+                    parent_message_id = initial_state.get("parent_message_id") if initial_state else None
+                    await handle.signal("new_message", args=(message, plan_steps, flow, mode, run_id, parent_message_id))
+                    logger.info(f"[SIGNAL_SEND] Sent message signal to existing workflow {workflow_id} session={session_id} mode={mode} run_id={run_id} message_preview={message[:50]}...")
                     return handle
             except Exception as get_error:
                 logger.error(f"Failed to get existing workflow {workflow_id}: {get_error}", exc_info=True)

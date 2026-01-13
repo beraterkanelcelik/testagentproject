@@ -2,6 +2,7 @@
 Agent execution endpoints.
 """
 import json
+import os
 import uuid
 import asyncio
 from django.http import JsonResponse, StreamingHttpResponse
@@ -19,9 +20,11 @@ logger = get_logger(__name__)
 
 @csrf_exempt
 @require_http_methods(["POST"])
-def run_agent(request):
+async def run_agent(request):
     """
-    Run agent with input message.
+    Run agent with input message (non-streaming, uses Temporal for durability).
+    
+    Uses hybrid response: blocks briefly for fast completions, otherwise returns 202 + fetch endpoint.
     
     Request body:
     {
@@ -30,14 +33,11 @@ def run_agent(request):
     }
     
     Returns:
-    {
-        "run_id": str,
-        "response": str,
-        "agent": str,
-        "tool_calls": list
-    }
+    - 200 OK: {"status": "completed", "response": {...}} (fast completion)
+    - 202 Accepted: {"status": "approval_required", "interrupt": {...}, "approve_endpoint": "...", "fetch": "..."} (HITL needed)
+    - 202 Accepted: {"status": "running", "fetch": "..."} (still running after timeout)
     """
-    user = get_current_user(request)
+    user = await get_current_user_async(request)
     if not user:
         logger.warning("Unauthenticated request to run_agent endpoint")
         return JsonResponse(
@@ -67,58 +67,111 @@ def run_agent(request):
                 status=400
             )
         
-        # Generate run ID
+        # Generate run ID for correlation (ensures /run polling returns correct message under concurrency)
         run_id = str(uuid.uuid4())
-        logger.info(f"Running agent for user {user.id}, session {chat_session_id}, run_id {run_id}, flow: {flow}")
+        logger.info(f"Running agent (non-stream) for user {user.id}, session {chat_session_id}, run_id {run_id}, flow: {flow}")
         
         # Save user message first (only if not plan execution)
+        user_message_id = None
         if flow != 'plan' and message:
             from app.services.chat_service import add_message
+            from asgiref.sync import sync_to_async
             try:
-                user_message = add_message(chat_session_id, 'user', message)
-                logger.debug(f"Saved user message {user_message.id} before agent execution")
+                user_message = await sync_to_async(add_message)(chat_session_id, 'user', message)
+                user_message_id = user_message.id
+                logger.debug(f"Saved user message {user_message_id} before agent execution")
             except Exception as e:
                 logger.error(f"Error saving user message: {e}", exc_info=True)
                 return JsonResponse({'error': 'Failed to save user message'}, status=500)
         
-        # Execute agent
-        result = execute_agent(
-            user_id=user.id,
-            chat_session_id=chat_session_id,
-            message=message,
-            plan_steps=plan_steps,
-            flow=flow
-        )
-        
-        if not result.get("success"):
-            logger.error(f"Agent execution failed for user {user.id}, session {chat_session_id}: {result.get('error')}")
-            return JsonResponse(
-                {'error': result.get("error", "Agent execution failed")},
-                status=500
+        # Use Temporal workflow for non-stream execution (durable, supports HITL)
+        try:
+            # Prepare initial state for workflow
+            tenant_id = str(user.id)  # Use user_id as tenant_id
+            workflow_state = {
+                "user_id": user.id,
+                "session_id": chat_session_id,
+                "message": message,
+                "plan_steps": plan_steps,
+                "flow": flow,
+                "tenant_id": tenant_id,
+                "run_id": run_id,  # Correlation ID for /run polling
+                "parent_message_id": user_message_id,  # Parent message ID for correlation
+                "org_slug": None,  # Not available in current implementation
+                "org_roles": [],  # Not available in current implementation
+                "app_roles": [],  # Not available in current implementation
+            }
+            
+            # Get or create workflow with mode="non_stream"
+            workflow_handle = await get_or_create_workflow(
+                user.id,
+                chat_session_id,
+                initial_state=workflow_state,
+                mode="non_stream"
             )
-        
-        logger.info(f"Agent execution completed successfully for run_id {run_id}")
-        response_data = {
-            'run_id': run_id,
-            'response': result.get("response", ""),
-            'agent': result.get("agent"),
-            'tool_calls': result.get("tool_calls", []),
-        }
-        
-        # Include type and plan if this is a plan_proposal response
-        if result.get("type") == "plan_proposal":
-            response_data["type"] = "plan_proposal"
-            if result.get("plan"):
-                response_data["plan"] = result.get("plan")
-        
-        # Include clarification and raw_tool_outputs if present
-        if result.get("clarification"):
-            response_data["clarification"] = result.get("clarification")
-        
-        if result.get("raw_tool_outputs"):
-            response_data["raw_tool_outputs"] = result.get("raw_tool_outputs")
-        
-        return JsonResponse(response_data)
+            logger.info(f"Using Temporal workflow {workflow_handle.id} for non-stream chat {chat_session_id}")
+            
+            # Poll workflow query for activity result (fast, in-memory, strongly consistent)
+            # Workflow query returns activity result without waiting for workflow completion
+            WAIT_TIMEOUT_SECONDS = int(os.getenv('RUN_AGENT_WAIT_TIMEOUT', '8'))
+            POLL_INTERVAL_SECONDS = 0.5  # Check query every 500ms
+            max_polls = int(WAIT_TIMEOUT_SECONDS / POLL_INTERVAL_SECONDS)
+            
+            fetch_endpoint = f"/api/chats/{chat_session_id}/messages/"
+            approve_endpoint = "/api/agent/approve-tool/"
+            
+            import time
+            
+            # Poll via workflow query (not DB, not workflow.result())
+            # Query is fast (in-memory), strongly consistent, and correlated by run_id
+            for _ in range(max_polls):
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                
+                try:
+                    # Import ChatWorkflow to access query method
+                    from app.agents.temporal.workflow import ChatWorkflow
+                    last_result = await workflow_handle.query(ChatWorkflow.get_last_result)
+                except Exception as e:
+                    logger.debug(f"Query failed: {e}")
+                    continue
+                
+                # Check if this result is for our request (correlation by run_id)
+                if last_result and last_result.get("run_id") == run_id:
+                    # Verify result is recent (avoid stale results from previous requests)
+                    result_age = time.time() - last_result.get("timestamp", 0)
+                    if result_age > WAIT_TIMEOUT_SECONDS + 5:  # Allow small buffer
+                        logger.warning(f"Stale result detected: age={result_age}s, run_id={run_id}")
+                        continue  # Keep polling
+                    
+                    status = last_result.get("status")
+                    
+                    if status == "completed":
+                        return JsonResponse({
+                            "status": "completed",
+                            "response": last_result["response"]
+                        })
+                    elif status == "interrupted":
+                        return JsonResponse({
+                            "status": "approval_required",
+                            "interrupt": last_result["interrupt"],
+                            "approve_endpoint": approve_endpoint,
+                            "fetch": fetch_endpoint
+                        }, status=202)
+                    elif status == "error":
+                        return JsonResponse({
+                            "error": last_result.get("error", "Unknown error")
+                        }, status=500)
+            
+            # Timeout - still running
+            return JsonResponse({
+                "status": "running",
+                "fetch": fetch_endpoint,
+                "message": "Request still processing. Fetch from DB endpoint to get results when ready."
+            }, status=202)
+            
+        except Exception as e:
+            logger.error(f"Error in non-stream execution for user {user.id}, session {chat_session_id}: {e}", exc_info=True)
+            return JsonResponse({'error': str(e)}, status=500)
     
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in run_agent request: {e}")
@@ -189,7 +242,17 @@ async def stream_agent(request):
                 return JsonResponse({'error': 'Failed to save user message'}, status=500)
         
         async def event_stream():
-            """Async generator for SSE events via Redis or direct streaming."""
+            """
+            Async generator for SSE events via Redis or direct streaming.
+            
+            IMPORTANT: Cancellation Behavior
+            - SSE disconnect only cancels Redis subscription loop
+            - Temporal workflow/activity continues running
+            - Results are persisted to DB and can be fetched later
+            - This is intentional for durability (work continues even if client disconnects)
+            - Execution continues on disconnect for both stream and non-stream modes
+            - Non-stream clients should rely on DB fetch/poll
+            """
             pubsub = None
             channel = None
             try:
@@ -242,16 +305,19 @@ async def stream_agent(request):
                                 "plan_steps": plan_steps,
                                 "flow": flow,
                                 "tenant_id": tenant_id,
+                                "parent_message_id": user_message_id,  # Pass parent_message_id for stable dedupe (even in stream mode)
                                 "org_slug": None,  # Not available in current implementation
                                 "org_roles": [],  # Not available in current implementation
                                 "app_roles": [],  # Not available in current implementation
                             }
                             
-                            # Get or create workflow - it will handle signaling automatically
+                            # Get or create workflow with mode="stream" - it will handle signaling automatically
+                            # Pass parent_message_id for stable dedupe (prevents same message via /stream then /run from being deduped)
                             workflow_handle = await get_or_create_workflow(
                                 user.id,
                                 chat_session_id,
-                                initial_state=workflow_state
+                                initial_state=workflow_state,
+                                mode="stream"
                             )
                             logger.info(f"Using Temporal workflow {workflow_handle.id} for chat {chat_session_id} (signal sent automatically)")
                         except Exception as e:
@@ -264,7 +330,7 @@ async def stream_agent(request):
                                 yield _format_sse_event(event)
                             return
                         
-                        # Listen to Redis messages with timeout handling
+                        # Listen to Redis messages with timeout handling and reconnection
                         # Scalability: Use shorter timeout for approval waiting (5 min) vs normal streaming (10 min)
                         # This prevents long-lived connections from consuming server resources
                         timeout_seconds = 600  # 10 minutes max for normal streaming
@@ -275,66 +341,202 @@ async def stream_agent(request):
                         last_heartbeat_time = start_time
                         heartbeat_interval = 30  # Send heartbeat every 30 seconds to keep connection alive
                         
+                        # Redis reconnection settings
+                        MAX_RECONNECT_ATTEMPTS = 3
+                        RECONNECT_DELAY = 1.0
+                        reconnect_attempt = 0
+                        
                         try:
-                            async for msg in pubsub.listen():
-                                current_time = loop.time()
-                                elapsed = current_time - start_time
-                                
-                                # Check timeout based on whether we're waiting for interrupt resume
-                                max_timeout = interrupt_wait_timeout if waiting_for_resume else timeout_seconds
-                                if elapsed > max_timeout:
-                                    logger.warning(f"Redis subscription timeout after {max_timeout}s for channel {channel} (waiting_for_resume={waiting_for_resume})")
-                                    yield _format_sse_event({"type": "error", "data": {"error": f"Subscription timeout after {max_timeout}s"}})
-                                    break
-                                
-                                # Send heartbeat to keep connection alive (prevents idle timeouts)
-                                # This is a scalability best practice for long-lived SSE connections
-                                if current_time - last_heartbeat_time >= heartbeat_interval:
-                                    try:
-                                        yield _format_sse_event({"type": "heartbeat", "data": {"timestamp": current_time}})
-                                        last_heartbeat_time = current_time
-                                    except Exception as e:
-                                        logger.debug(f"Failed to send heartbeat: {e}")
-                                
-                                # Filter subscription confirmation messages
-                                if msg['type'] == 'subscribe' or msg['type'] == 'psubscribe':
-                                    continue
-                                
-                                # Process actual messages
-                                if msg['type'] == 'message':
-                                    try:
-                                        event_data = json.loads(msg['data'].decode('utf-8'))
-                                        yield _format_sse_event(event_data)
-                                        event_type = event_data.get("type")
+                            # Reconnection loop with exponential backoff
+                            while reconnect_attempt < MAX_RECONNECT_ATTEMPTS:
+                                try:
+                                    # Subscribe if not already subscribed (first attempt or after reconnect)
+                                    if reconnect_attempt > 0:
+                                        logger.info(f"Reconnecting to Redis channel {channel} (attempt {reconnect_attempt}/{MAX_RECONNECT_ATTEMPTS})")
+                                        pubsub = redis_client.pubsub()
+                                        await pubsub.subscribe(channel)
                                         
-                                        # Track if we're waiting for interrupt resume (affects timeout)
-                                        if event_type == "interrupt":
-                                            waiting_for_resume = True
-                                            logger.info(f"[HITL] [SSE] Received interrupt event, connection will timeout after {interrupt_wait_timeout}s if no resume session={chat_session_id}")
-                                            # Don't break - keep connection open but with shorter timeout
-                                            # This balances scalability (timeout) with UX (no reconnection needed)
-                                            continue
-                                        elif event_type in ["final", "error", "done"]:
-                                            # Close connection on final/error/done
+                                        # Wait for subscription confirmation
+                                        confirm_msg = await pubsub.get_message(timeout=5.0)
+                                        if confirm_msg and confirm_msg['type'] == 'subscribe':
+                                            logger.info(f"Reconnected to Redis channel: {channel}")
+                                        else:
+                                            logger.warning(f"Unexpected subscription confirmation after reconnect: {confirm_msg}")
+                                    
+                                    # Reset reconnect attempt on successful connection
+                                    reconnect_attempt = 0
+                                    
+                                    # Listen to messages
+                                    async for msg in pubsub.listen():
+                                        current_time = loop.time()
+                                        elapsed = current_time - start_time
+                                        
+                                        # Check timeout based on whether we're waiting for interrupt resume
+                                        max_timeout = interrupt_wait_timeout if waiting_for_resume else timeout_seconds
+                                        if elapsed > max_timeout:
+                                            logger.warning(f"Redis subscription timeout after {max_timeout}s for channel {channel} (waiting_for_resume={waiting_for_resume})")
+                                            yield _format_sse_event({"type": "error", "data": {"error": f"Subscription timeout after {max_timeout}s"}})
                                             break
-                                    except json.JSONDecodeError as e:
-                                        logger.warning(f"Failed to decode Redis message: {e}")
-                                        continue
-                                    except Exception as e:
-                                        logger.error(f"Error processing Redis message: {e}", exc_info=True)
-                                        continue
-                                elif msg['type'] == 'unsubscribe' or msg['type'] == 'punsubscribe':
-                                    # Unsubscribed, exit loop
-                                    logger.debug(f"Unsubscribed from channel: {channel}")
+                                        
+                                        # Send heartbeat to keep connection alive (prevents idle timeouts)
+                                        # This is a scalability best practice for long-lived SSE connections
+                                        if current_time - last_heartbeat_time >= heartbeat_interval:
+                                            try:
+                                                yield _format_sse_event({"type": "heartbeat", "data": {"timestamp": current_time}})
+                                                last_heartbeat_time = current_time
+                                            except Exception as e:
+                                                logger.debug(f"Failed to send heartbeat: {e}")
+                                        
+                                        # Filter subscription confirmation messages
+                                        if msg['type'] == 'subscribe' or msg['type'] == 'psubscribe':
+                                            continue
+                                        
+                                        # Process actual messages
+                                        if msg['type'] == 'message':
+                                            try:
+                                                event_data = json.loads(msg['data'].decode('utf-8'))
+                                                yield _format_sse_event(event_data)
+                                                event_type = event_data.get("type")
+                                                
+                                                # Track if we're waiting for interrupt resume (affects timeout)
+                                                if event_type == "interrupt":
+                                                    waiting_for_resume = True
+                                                    logger.info(f"[HITL] [SSE] Received interrupt event, connection will timeout after {interrupt_wait_timeout}s if no resume session={chat_session_id}")
+                                                    # Don't break - keep connection open but with shorter timeout
+                                                    # This balances scalability (timeout) with UX (no reconnection needed)
+                                                    continue
+                                                elif event_type in ["final", "error", "done"]:
+                                                    # Close connection on final/error/done
+                                                    break
+                                            except json.JSONDecodeError as e:
+                                                logger.warning(f"Failed to decode Redis message: {e}")
+                                                continue
+                                            except Exception as e:
+                                                logger.error(f"Error processing Redis message: {e}", exc_info=True)
+                                                continue
+                                        elif msg['type'] == 'unsubscribe' or msg['type'] == 'punsubscribe':
+                                            # Unsubscribed, exit loop
+                                            logger.debug(f"Unsubscribed from channel: {channel}")
+                                            break
+                                    
+                                    # If we break from the listen loop normally (not due to error), exit reconnection loop
                                     break
+                                    
+                                except Exception as e:
+                                    # Handle connection errors - check if reconnection is warranted
+                                    error_str = str(e).lower()
+                                    is_connection_error = any(
+                                        phrase in error_str 
+                                        for phrase in ['connection', 'disconnected', 'broken pipe', 'timeout']
+                                    )
+                                    
+                                    if is_connection_error and reconnect_attempt < MAX_RECONNECT_ATTEMPTS:
+                                        reconnect_attempt += 1
+                                        delay = RECONNECT_DELAY * (2 ** (reconnect_attempt - 1))  # Exponential backoff
+                                        logger.warning(f"Redis connection error, reconnecting in {delay}s (attempt {reconnect_attempt}/{MAX_RECONNECT_ATTEMPTS}): {e}")
+                                        await asyncio.sleep(delay)
+                                        continue  # Continue outer loop to reconnect
+                                    else:
+                                        # Not a connection error or max attempts reached, re-raise
+                                        raise
+                                        
                         except asyncio.CancelledError:
                             logger.info(f"Redis subscription cancelled for channel {channel}")
                             raise
                         except Exception as e:
-                            logger.error(f"Error in Redis subscription loop: {e}", exc_info=True)
-                            yield _format_sse_event({"type": "error", "data": {"error": str(e)}})
+                            # Final exception handling - if we've exhausted reconnection attempts
+                            if reconnect_attempt >= MAX_RECONNECT_ATTEMPTS:
+                                logger.error(f"Redis subscription failed after {MAX_RECONNECT_ATTEMPTS} reconnection attempts: {e}", exc_info=True)
+                            else:
+                                logger.error(f"Error in Redis subscription loop: {e}", exc_info=True)
+                            
+                            # Stream failure recovery: best-effort fetch from DB (non-blocking)
+                            fetch_endpoint = f"/api/chats/{chat_session_id}/messages/"
+                            try:
+                                # Best-effort: try to get latest assistant message (non-blocking, don't wait/poll)
+                                from app.db.models.message import Message
+                                from asgiref.sync import sync_to_async
+                                
+                                latest_assistant_msg = await sync_to_async(
+                                    lambda: Message.objects.filter(
+                                        session_id=chat_session_id,
+                                        role="assistant"
+                                    ).order_by('-created_at').first()
+                                )()
+                                
+                                if latest_assistant_msg:
+                                    # Found message - emit recovery event
+                                    yield _format_sse_event({
+                                        "type": "recovery",
+                                        "data": {
+                                            "message_id": latest_assistant_msg.id,
+                                            "content": latest_assistant_msg.content or "",
+                                            "fetch": fetch_endpoint,
+                                            "suggestion": "Stream failed, fetched from DB"
+                                        }
+                                    })
+                                else:
+                                    # No message found - emit error with fetch endpoint
+                                    yield _format_sse_event({
+                                        "type": "error",
+                                        "data": {
+                                            "error": "Stream failed",
+                                            "fetch": fetch_endpoint,
+                                            "recovery": "Fetch from DB endpoint to get latest"
+                                        }
+                                    })
+                            except Exception as recovery_error:
+                                # Recovery fetch failed - still emit error with fetch endpoint
+                                logger.debug(f"Recovery fetch failed: {recovery_error}")
+                                yield _format_sse_event({
+                                    "type": "error",
+                                    "data": {
+                                        "error": "Stream failed",
+                                        "fetch": fetch_endpoint,
+                                        "recovery": "Fetch from DB endpoint to get latest"
+                                    }
+                                })
+                            # Exit generator after emitting recovery/error events
+                            return
                     except Exception as redis_error:
                         logger.warning(f"Redis streaming failed, falling back to direct: {redis_error}", exc_info=True)
+                        
+                        # Stream failure recovery: best-effort fetch from DB before falling back
+                        fetch_endpoint = f"/api/chats/{chat_session_id}/messages/"
+                        try:
+                            from app.db.models.message import Message
+                            from asgiref.sync import sync_to_async
+                            
+                            latest_assistant_msg = await sync_to_async(
+                                lambda: Message.objects.filter(
+                                    session_id=chat_session_id,
+                                    role="assistant"
+                                ).order_by('-created_at').first()
+                            )()
+                            
+                            if latest_assistant_msg:
+                                yield _format_sse_event({
+                                    "type": "recovery",
+                                    "data": {
+                                        "message_id": latest_assistant_msg.id,
+                                        "content": latest_assistant_msg.content or "",
+                                        "fetch": fetch_endpoint,
+                                        "suggestion": "Stream failed, fetched from DB"
+                                    }
+                                })
+                            else:
+                                yield _format_sse_event({
+                                    "type": "error",
+                                    "data": {
+                                        "error": "Stream failed",
+                                        "fetch": fetch_endpoint,
+                                        "recovery": "Fetch from DB endpoint to get latest"
+                                    }
+                                })
+                        except Exception:
+                            # Ignore recovery errors - will fall through to direct streaming
+                            pass
+                        
                         # Fall through to direct streaming
                         use_redis = False
                 
@@ -419,14 +621,31 @@ async def stream_agent(request):
             
             return f"data: {json.dumps(event, default=str)}\n\n"
         
+        # Emit initial event with metadata about disconnect behavior
+        # Note: This will be the first event in the stream
+        async def event_stream_with_metadata():
+            # Yield initial metadata event
+            yield _format_sse_event({
+                "type": "stream_start",
+                "metadata": {
+                    "continues_on_disconnect": True,
+                    "fetch": f"/api/chats/{chat_session_id}/messages/"
+                }
+            })
+            # Then yield all other events
+            async for event in event_stream():
+                yield event
+        
         # Django 5.0+ supports async generators directly with StreamingHttpResponse
         # No need for sync wrapper or new event loops - everything runs in the same async context
         response = StreamingHttpResponse(
-            event_stream(),
+            event_stream_with_metadata(),
             content_type='text/event-stream'
         )
         response['Cache-Control'] = 'no-cache'
         response['X-Accel-Buffering'] = 'no'
+        # Document cancellation behavior in header
+        response['X-Execution-Continues-On-Disconnect'] = 'true'
         return response
     
     except json.JSONDecodeError as e:
@@ -509,10 +728,85 @@ async def approve_tool(request):
                 'error': f'Failed to send resume signal: {str(e)}'
             }, status=500)
         
-        logger.info(f"[HITL] [RESUME] Resume flow completed: session={chat_session_id}")
+        # Block and wait for final response (non-streaming mode: wait for completion)
+        # This eliminates the need for frontend polling
+        from app.db.models.message import Message
+        from asgiref.sync import sync_to_async
+        import time
         
+        WAIT_TIMEOUT_SECONDS = int(os.getenv('APPROVE_TOOL_WAIT_TIMEOUT', '30'))  # Longer timeout for tool execution
+        POLL_INTERVAL_SECONDS = 0.5
+        
+        # Get the user message ID that triggered this approval (for correlation)
+        # Find the most recent user message in this session
+        user_message = await sync_to_async(
+            lambda: Message.objects.filter(
+                session_id=chat_session_id,
+                role="user"
+            ).order_by('-created_at').first()
+        )()
+        
+        user_message_id = user_message.id if user_message else None
+        
+        start_time = time.time()
+        
+        # Poll for final assistant message (after tool execution completes)
+        while (time.time() - start_time) < WAIT_TIMEOUT_SECONDS:
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            
+            try:
+                # Find assistant message created after the user message (final response)
+                latest_assistant_msg = await sync_to_async(
+                    lambda: Message.objects.filter(
+                        session_id=chat_session_id,
+                        role="assistant"
+                    ).order_by('-created_at').first()
+                )()
+                
+                # Check if this is a new message (after the user message that triggered approval)
+                if latest_assistant_msg and user_message_id:
+                    # Check if this assistant message was created after the user message
+                    if latest_assistant_msg.id > user_message_id or latest_assistant_msg.created_at > user_message.created_at:
+                        # Check if it has content (final response, not just tool calls)
+                        metadata = latest_assistant_msg.metadata or {}
+                        tool_calls = metadata.get("tool_calls", [])
+                        has_content = latest_assistant_msg.content and latest_assistant_msg.content.strip()
+                        
+                        # If it has content, it's the final response
+                        if has_content:
+                            # Return final response directly (no polling needed in frontend)
+                            return JsonResponse({
+                                'success': True,
+                                'response': {
+                                    'reply': latest_assistant_msg.content or "",
+                                    'agent_name': metadata.get("agent_name", "assistant"),
+                                    'tool_calls': tool_calls,
+                                }
+                            })
+                elif latest_assistant_msg:
+                    # Fallback: if we can't correlate, check if message has content
+                    metadata = latest_assistant_msg.metadata or {}
+                    if latest_assistant_msg.content and latest_assistant_msg.content.strip():
+                        return JsonResponse({
+                            'success': True,
+                            'response': {
+                                'reply': latest_assistant_msg.content or "",
+                                'agent_name': metadata.get("agent_name", "assistant"),
+                                'tool_calls': metadata.get("tool_calls", []),
+                            }
+                        })
+                        
+            except Exception as e:
+                logger.debug(f"Error polling DB for final response after approval: {e}")
+                continue
+        
+        # Timeout - workflow might still be processing
+        logger.warning(f"[HITL] [RESUME] Timeout waiting for final response after approval: session={chat_session_id}")
         return JsonResponse({
             'success': True,
+            'status': 'processing',
+            'message': 'Tool approved and executing. Response will be available shortly.',
+            'fetch': f"/api/chats/{chat_session_id}/messages/"
         })
     
     except json.JSONDecodeError as e:
