@@ -1,5 +1,8 @@
 import React from 'react'
-import ReactJson from '@microlink/react-json-view'
+// Handle both ESM and CommonJS exports - use namespace import for compatibility
+import * as ReactJsonModule from '@microlink/react-json-view'
+// Extract the component - handle both default and named exports
+const ReactJson = (ReactJsonModule as any).default || (ReactJsonModule as any).ReactJsonView || ReactJsonModule
 
 interface JsonViewerProps {
   data: any

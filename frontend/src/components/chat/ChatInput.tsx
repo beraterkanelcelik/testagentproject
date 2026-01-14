@@ -94,7 +94,7 @@ export default function ChatInput({
     e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`
   }
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const handleKeyDown = (e: { key: string; shiftKey: boolean; preventDefault: () => void }) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       onSend()

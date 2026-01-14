@@ -18,7 +18,7 @@ import { useNavigate } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import JsonViewer from '@/components/JsonViewer'
 
-interface ToolCallItemProps {
+export interface ToolCallItemProps {
   /** Tool call data */
   toolCall: any
   /** Unique identifier for this tool call */
@@ -28,9 +28,9 @@ interface ToolCallItemProps {
   /** Callback to toggle expansion */
   onToggle: () => void
   /** Callback when user approves the tool call */
-  onApprove: (toolCallId: string) => Promise<void>
+  onApprove: () => Promise<void>
   /** Callback when user rejects the tool call */
-  onReject?: (toolCallId: string) => Promise<void>
+  onReject?: () => Promise<void>
   /** Set of tool call IDs currently being approved */
   approvingToolCalls: Set<string>
   /** Current session (required for approval) */
@@ -141,7 +141,7 @@ export default function ToolCallItem({
             <button
               onClick={(e) => {
                 e.stopPropagation()
-                onApprove(toolCall.id || toolCallId)
+                onApprove()
               }}
               disabled={isApproving}
               className="h-7 px-3 rounded-md border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950/30 text-green-700 dark:text-green-400 hover:bg-green-100 dark:hover:bg-green-950/50 flex items-center justify-center gap-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-xs font-medium"
@@ -155,7 +155,7 @@ export default function ToolCallItem({
               onClick={(e) => {
                 e.stopPropagation()
                 if (onReject) {
-                  onReject(toolCall.id || toolCallId)
+                  onReject()
                 }
               }}
               disabled={isApproving}

@@ -189,8 +189,6 @@ class EventCallbackHandler(BaseCallbackHandler):
                                     "Processing with agent...": "Processed with agent",
                                     "Routing to agent...": "Routed to agent",
                                     "Loading conversation history...": "Loaded conversation history",
-                                    "Processing with greeter agent...": "Processed with greeter agent",
-                                    "Searching documents...": "Searched documents",
                                     "Executing tools...": "Executed tools",
                                     "Processing tool results...": "Processed tool results",
                                     "Checking if summarization needed...": "Checked if summarization needed",

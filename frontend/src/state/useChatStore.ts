@@ -44,6 +44,12 @@ export interface Message {
   clarification?: string
   raw_tool_outputs?: Array<Record<string, any>>
   status?: string  // Current task/status message (e.g., "Thinking...", "Searching documents...")
+  context_usage?: {
+    total_tokens: number
+    context_window: number
+    usage_percentage: number
+    tokens_remaining: number
+  }
 }
 
 interface ChatState {

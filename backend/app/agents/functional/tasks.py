@@ -9,19 +9,17 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, System
 from langchain_core.runnables import RunnableConfig
 from app.agents.functional.models import AgentResponse, RoutingDecision, ToolResult
 from app.agents.agents.supervisor import SupervisorAgent
-from app.agents.agents.greeter import GreeterAgent
-from app.agents.agents.search import SearchAgent
+from app.agents.registry import get_agent  # Use generic agent registry
 from app.services.chat_service import get_messages, add_message
 from app.db.models.session import ChatSession
 from app.agents.config import OPENAI_MODEL
 from app.core.logging import get_logger
 from app.rag.chunking.tokenizer import count_tokens
+from app.agents.context_usage import calculate_context_usage
 
 logger = get_logger(__name__)
 
 supervisor_agent = SupervisorAgent()
-greeter_agent_cache = {}
-search_agent_cache = {}
 
 # Maximum size for tool outputs before truncation (50KB)
 MAX_TOOL_OUTPUT_SIZE = 50_000
@@ -151,8 +149,48 @@ def load_messages_task(
     return messages
 
 
+def _extract_token_usage(response: AIMessage) -> Dict[str, int]:
+    """Extract token usage from AI response (reusable helper)"""
+    token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+    if hasattr(response, 'usage_metadata') and response.usage_metadata:
+        usage = response.usage_metadata
+        token_usage = {
+            "input_tokens": usage.get('input_tokens', 0),
+            "output_tokens": usage.get('output_tokens', 0),
+            "total_tokens": usage.get('total_tokens', 0),
+        }
+    elif hasattr(response, 'response_metadata') and response.response_metadata:
+        usage = response.response_metadata.get('token_usage', {})
+        if usage:
+            token_usage = {
+                "input_tokens": usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0),
+                "output_tokens": usage.get('completion_tokens', 0) or usage.get('output_tokens', 0),
+                "total_tokens": usage.get('total_tokens', 0),
+            }
+
+    return token_usage
+
+
+def _extract_tool_calls(response: AIMessage) -> List[Dict[str, Any]]:
+    """Extract tool calls from AI response (reusable helper)"""
+    tool_calls = []
+
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        for tc in response.tool_calls:
+            tool_calls.append({
+                "tool": tc.get("name", ""),
+                "name": tc.get("name", ""),
+                "args": tc.get("args", {}),
+                "id": tc.get("id", ""),
+            })
+
+    return tool_calls
+
+
 @task
-def greeter_agent_task(
+def generic_agent_task(
+    agent_name: str,
     query: str,
     messages: List[BaseMessage],
     user_id: Optional[int],
@@ -160,268 +198,95 @@ def greeter_agent_task(
     config: Optional[RunnableConfig] = None
 ) -> AgentResponse:
     """
-    Execute greeter agent and return response.
-    
+    Generic agent task - works for ANY agent.
+
+    Replaces hardcoded greeter_agent_task, search_agent_task, etc.
+
     Args:
+        agent_name: Name of agent to execute (e.g., "greeter", "search")
         query: User query
         messages: Conversation history
         user_id: User ID for tool access
         model_name: Optional model name
         config: Optional runtime config (for callbacks)
-        
+
     Returns:
-        AgentResponse with reply
+        AgentResponse with reply and context usage
     """
     try:
-        logger.info(f"[GREETER_TASK] Starting greeter_agent_task query_preview={query[:50] if query else '(empty)'}... user_id={user_id} messages_count={len(messages)}")
-        
+        logger.info(f"[AGENT_TASK] Starting {agent_name} agent: query_preview={query[:50] if query else '(empty)'}... user_id={user_id}")
+
+        # Get agent from registry (generic!)
+        agent = get_agent(agent_name, user_id, model_name or OPENAI_MODEL)
+
         # Check if summarization is needed
         needs_summarization = check_summarization_needed_task(
             messages=messages,
             token_threshold=40000,
             model_name=model_name
         ).result()
-        
-        # Get or create greeter agent
-        cache_key = f"{user_id}:{model_name or 'default'}"
-        if cache_key not in greeter_agent_cache:
-            greeter_agent_cache[cache_key] = GreeterAgent(user_id=user_id, model_name=model_name)
-        greeter_agent = greeter_agent_cache[cache_key]
-        
+
         # Apply summarization middleware if needed
         if needs_summarization:
             from app.agents.functional.middleware import create_agent_with_summarization
-            from langgraph.checkpoint.postgres import PostgresSaver
-            from app.settings import DATABASES
+            # Reuse the global checkpointer instance instead of creating a new one
+            # This follows LangGraph best practices: single checkpointer instance per app
+            from app.agents.functional.workflow import get_checkpointer
             
-            # Get checkpointer for middleware
-            checkpointer = None
-            try:
-                db_config = DATABASES['default']
-                db_url = (
-                    f"postgresql://{db_config['USER']}:{db_config['PASSWORD']}"
-                    f"@{db_config['HOST']}:{db_config['PORT']}/{db_config['NAME']}"
+            checkpointer = get_checkpointer()
+            if checkpointer:
+                agent = create_agent_with_summarization(
+                    agent=agent,
+                    model_name=model_name or OPENAI_MODEL,
+                    checkpointer=checkpointer
                 )
-                checkpointer_cm = PostgresSaver.from_conn_string(db_url)
-                if hasattr(checkpointer_cm, '__enter__'):
-                    checkpointer = checkpointer_cm.__enter__()
-            except Exception as e:
-                logger.warning(f"Failed to get checkpointer for summarization: {e}")
-            
-            greeter_agent = create_agent_with_summarization(
-                agent=greeter_agent,
-                model_name=model_name or OPENAI_MODEL,
-                checkpointer=checkpointer
-            )
-            logger.info("Applied SummarizationMiddleware to greeter agent")
-        
+                logger.info(f"Applied SummarizationMiddleware to {agent_name} agent")
+            else:
+                logger.warning(f"Checkpointer not available, skipping summarization middleware for {agent_name}")
+
         # Add user message if not already in messages
         if not messages or not isinstance(messages[-1], HumanMessage) or messages[-1].content != query:
             messages = messages + [HumanMessage(content=query)]
-        
-        # Invoke agent - LangChain will automatically enable streaming
-        # when LangGraph is in streaming mode (stream_mode=["messages"])
-        # This allows LangGraph to capture and stream tokens incrementally
+
+        # Invoke agent
         invoke_kwargs = {}
         if config:
             invoke_kwargs['config'] = config
-        
-        logger.info(f"[GREETER_TASK] Invoking greeter agent with {len(messages)} messages, config_present={bool(config)}")
-        response = greeter_agent.invoke(messages, **invoke_kwargs)
-        logger.info(f"[GREETER_TASK] Greeter agent response received: type={type(response)}, has_content={hasattr(response, 'content')}, content_length={len(response.content) if hasattr(response, 'content') and response.content else 0}, content_preview={response.content[:50] if hasattr(response, 'content') and response.content else '(empty)'}...")
-        
-        # Extract token usage
-        token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        if hasattr(response, 'usage_metadata') and response.usage_metadata:
-            usage = response.usage_metadata
-            token_usage = {
-                "input_tokens": usage.get('input_tokens', 0),
-                "output_tokens": usage.get('output_tokens', 0),
-                "total_tokens": usage.get('total_tokens', 0),
-            }
-        elif hasattr(response, 'response_metadata') and response.response_metadata:
-            usage = response.response_metadata.get('token_usage', {})
-            if usage:
-                token_usage = {
-                    "input_tokens": usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0),
-                    "output_tokens": usage.get('completion_tokens', 0) or usage.get('output_tokens', 0),
-                    "total_tokens": usage.get('total_tokens', 0),
-                }
-        
-        # Extract tool calls (preserve full tool_call structure including IDs)
-        tool_calls = []
-        if hasattr(response, 'tool_calls') and response.tool_calls:
-            for tc in response.tool_calls:
-                tool_calls.append({
-                    "tool": tc.get("name", ""),
-                    "name": tc.get("name", ""),
-                    "args": tc.get("args", {}),
-                    "id": tc.get("id", ""),  # Preserve tool_call ID
-                })
-        
-        # Add the AIMessage to messages list if it has tool_calls
-        # This is needed for proper ToolMessage handling
+
+        logger.info(f"[AGENT_TASK] Invoking {agent_name} agent with {len(messages)} messages")
+        response = agent.invoke(messages, **invoke_kwargs)
+
+        # Extract token usage and tool calls (using helpers)
+        token_usage = _extract_token_usage(response)
+        tool_calls = _extract_tool_calls(response)
+
+        # Calculate context usage for frontend
+        context_usage = calculate_context_usage(messages, model_name or OPENAI_MODEL)
+
+        # Add AIMessage if it has tool_calls
         if hasattr(response, 'tool_calls') and response.tool_calls:
             messages = messages + [response]
-        
+
         reply_content = response.content if hasattr(response, 'content') else str(response)
-        logger.info(f"[GREETER_TASK] Creating AgentResponse: reply_length={len(reply_content) if reply_content else 0}, tool_calls_count={len(tool_calls)}")
-        
+
         agent_response = AgentResponse(
             type="answer",
             reply=reply_content,
             tool_calls=tool_calls,
             token_usage=token_usage,
-            agent_name=greeter_agent.name  # Use agent's actual name property
+            agent_name=agent.name,
+            context_usage=context_usage  # NEW: Context usage tracking
         )
-        
-        logger.info(f"[GREETER_TASK] Returning AgentResponse: has_reply={bool(agent_response.reply)}, reply_preview={agent_response.reply[:50] if agent_response.reply else '(empty)'}...")
+
+        logger.info(f"[AGENT_TASK] {agent_name} completed: context={context_usage['usage_percentage']}%")
         return agent_response
+
     except Exception as e:
-        logger.error(f"[GREETER_TASK] Error in greeter_agent_task: {e}", exc_info=True)
-        # Fallback: use "greeter" if agent instance is not available
+        logger.error(f"[AGENT_TASK] Error in {agent_name} agent: {e}", exc_info=True)
         return AgentResponse(
             type="answer",
             reply=f"I apologize, but I encountered an error: {str(e)}",
-            agent_name="greeter"
-        )
-
-
-@task
-def search_agent_task(
-    query: str,
-    messages: List[BaseMessage],
-    user_id: Optional[int],
-    model_name: Optional[str] = None,
-    config: Optional[RunnableConfig] = None
-) -> AgentResponse:
-    """
-    Execute search agent and return response.
-    
-    Args:
-        query: User query
-        messages: Conversation history
-        user_id: User ID for tool access
-        model_name: Optional model name
-        config: Optional runtime config (for callbacks)
-        
-    Returns:
-        AgentResponse with reply
-    """
-    try:
-        # Check if summarization is needed
-        needs_summarization = check_summarization_needed_task(
-            messages=messages,
-            token_threshold=40000,
-            model_name=model_name
-        ).result()
-        
-        # Get or create search agent
-        cache_key = f"{user_id}:{model_name or 'default'}"
-        if cache_key not in search_agent_cache:
-            search_agent_cache[cache_key] = SearchAgent(user_id=user_id, model_name=model_name)
-        search_agent = search_agent_cache[cache_key]
-        
-        # Apply summarization middleware if needed
-        if needs_summarization:
-            from app.agents.functional.middleware import create_agent_with_summarization
-            from langgraph.checkpoint.postgres import PostgresSaver
-            from app.settings import DATABASES
-            
-            # Get checkpointer for middleware
-            checkpointer = None
-            try:
-                db_config = DATABASES['default']
-                db_url = (
-                    f"postgresql://{db_config['USER']}:{db_config['PASSWORD']}"
-                    f"@{db_config['HOST']}:{db_config['PORT']}/{db_config['NAME']}"
-                )
-                checkpointer_cm = PostgresSaver.from_conn_string(db_url)
-                if hasattr(checkpointer_cm, '__enter__'):
-                    checkpointer = checkpointer_cm.__enter__()
-            except Exception as e:
-                logger.warning(f"Failed to get checkpointer for summarization: {e}")
-            
-            search_agent = create_agent_with_summarization(
-                agent=search_agent,
-                model_name=model_name or OPENAI_MODEL,
-                checkpointer=checkpointer
-            )
-            logger.info("Applied SummarizationMiddleware to search agent")
-        
-        # Add user message if not already in messages
-        if not messages or not isinstance(messages[-1], HumanMessage) or messages[-1].content != query:
-            messages = messages + [HumanMessage(content=query)]
-        
-        # Invoke agent - LangChain will automatically enable streaming
-        # when LangGraph is in streaming mode (stream_mode=["messages"])
-        # This allows LangGraph to capture and stream tokens incrementally
-        invoke_kwargs = {}
-        if config:
-            invoke_kwargs['config'] = config
-        
-        logger.info(f"[SEARCH_TASK] Invoking search agent with {len(messages)} messages, config_present={bool(config)}")
-        response = search_agent.invoke(messages, **invoke_kwargs)
-        logger.info(f"[SEARCH_TASK] Search agent response received: type={type(response)}, has_content={hasattr(response, 'content')}, content_length={len(response.content) if hasattr(response, 'content') and response.content else 0}, has_tool_calls={hasattr(response, 'tool_calls') and bool(response.tool_calls)}, tool_calls_count={len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0}")
-        
-        # Extract token usage
-        token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        if hasattr(response, 'usage_metadata') and response.usage_metadata:
-            usage = response.usage_metadata
-            token_usage = {
-                "input_tokens": usage.get('input_tokens', 0),
-                "output_tokens": usage.get('output_tokens', 0),
-                "total_tokens": usage.get('total_tokens', 0),
-            }
-        elif hasattr(response, 'response_metadata') and response.response_metadata:
-            usage = response.response_metadata.get('token_usage', {})
-            if usage:
-                token_usage = {
-                    "input_tokens": usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0),
-                    "output_tokens": usage.get('completion_tokens', 0) or usage.get('output_tokens', 0),
-                    "total_tokens": usage.get('total_tokens', 0),
-                }
-        
-        # Extract tool calls (preserve full tool_call structure including IDs)
-        tool_calls = []
-        if hasattr(response, 'tool_calls') and response.tool_calls:
-            logger.info(f"[SEARCH_TASK] Extracting {len(response.tool_calls)} tool calls from response")
-            for tc in response.tool_calls:
-                tool_call_dict = {
-                    "tool": tc.get("name", ""),
-                    "name": tc.get("name", ""),
-                    "args": tc.get("args", {}),
-                    "id": tc.get("id", ""),  # Preserve tool_call ID
-                }
-                tool_calls.append(tool_call_dict)
-                logger.info(f"[SEARCH_TASK] Extracted tool call: name={tool_call_dict['name']}, args={tool_call_dict['args']}, id={tool_call_dict['id']}")
-        else:
-            logger.info(f"[SEARCH_TASK] No tool calls in response: has_tool_calls_attr={hasattr(response, 'tool_calls')}, tool_calls_value={getattr(response, 'tool_calls', None)}")
-        
-        # Add the AIMessage to messages list if it has tool_calls
-        # This is needed for proper ToolMessage handling
-        if hasattr(response, 'tool_calls') and response.tool_calls:
-            messages = messages + [response]
-        
-        reply_content = response.content if hasattr(response, 'content') else str(response)
-        logger.info(f"[SEARCH_TASK] Creating AgentResponse: reply_length={len(reply_content) if reply_content else 0}, tool_calls_count={len(tool_calls)}")
-        
-        agent_response = AgentResponse(
-            type="answer",
-            reply=reply_content,
-            tool_calls=tool_calls,
-            token_usage=token_usage,
-            agent_name=search_agent.name  # Use agent's actual name property
-        )
-        
-        logger.info(f"[SEARCH_TASK] Returning AgentResponse: has_reply={bool(agent_response.reply)}, reply_preview={agent_response.reply[:50] if agent_response.reply else '(empty)'}..., tool_calls_count={len(agent_response.tool_calls)}")
-        return agent_response
-    except Exception as e:
-        logger.error(f"Error in search_agent_task: {e}", exc_info=True)
-        return AgentResponse(
-            type="answer",
-            reply=f"I apologize, but I encountered an error: {str(e)}",
-            agent_name="search"
+            agent_name=agent_name
         )
 
 
@@ -436,29 +301,23 @@ def agent_task(
     config: Optional[RunnableConfig] = None
 ) -> AgentResponse:
     """
-    Execute a generic agent (routes to specific agent tasks).
+    Execute a generic agent (uses registry, no hardcoded routing).
     
     Args:
         agent_name: Name of agent to execute
         query: User query
         messages: Conversation history
         user_id: User ID
-        tool_results: Optional tool execution results
+        tool_results: Optional tool execution results (currently unused, for future use)
         model_name: Optional model name
         config: Optional runtime config (for callbacks)
         
     Returns:
         AgentResponse with reply
     """
-    # Note: config is automatically injected by LangGraph when calling tasks from within tasks
-    if agent_name == "greeter":
-        return greeter_agent_task(query, messages, user_id, model_name).result()
-    elif agent_name == "search":
-        return search_agent_task(query, messages, user_id, model_name).result()
-    else:
-        # Unknown agent - fallback to greeter
-        logger.warning(f"Unknown agent '{agent_name}', falling back to greeter")
-        return greeter_agent_task(query, messages, user_id, model_name).result()
+    # Call generic_agent_task and get result (both are @task, so need .result())
+    # Note: Don't pass config explicitly - LangGraph auto-injects it for @task functions
+    return generic_agent_task(agent_name, query, messages, user_id, model_name).result()
 
 
 @task
@@ -511,24 +370,9 @@ def tool_execution_task(
         except ChatSession.DoesNotExist:
             pass
     
-    # Get agent for tools based on agent_name
-    # Use same cache key format as agent tasks
-    cache_key = f"{user_id}:{model_name or 'default'}"
-    agent = None
-    
-    if agent_name == "greeter":
-        if cache_key not in greeter_agent_cache:
-            greeter_agent_cache[cache_key] = GreeterAgent(user_id=user_id, model_name=model_name)
-        agent = greeter_agent_cache[cache_key]
-    elif agent_name == "search":
-        if cache_key not in search_agent_cache:
-            search_agent_cache[cache_key] = SearchAgent(user_id=user_id, model_name=model_name)
-        agent = search_agent_cache[cache_key]
-    else:
-        # Fallback to greeter
-        if cache_key not in greeter_agent_cache:
-            greeter_agent_cache[cache_key] = GreeterAgent(user_id=user_id, model_name=model_name)
-        agent = greeter_agent_cache[cache_key]
+    # Get agent for tools using generic registry (no hardcoded agent caches)
+    from app.agents.registry import get_agent
+    agent = get_agent(agent_name, user_id, model_name)
     
     # Get tools from agent
     tools = agent.get_tools()
@@ -752,15 +596,9 @@ def agent_with_tool_results_task(
     try:
         logger.info(f"[AGENT_WITH_TOOL_RESULTS] Starting for agent={agent_name}, query_preview={query[:50] if query else '(empty)'}..., messages_count={len(messages)}, tool_results_count={len(tool_results) if tool_results else 0}")
         
-        # Route to appropriate agent task
+        # Use generic agent task (no hardcoded routing)
         # Note: config is automatically injected by LangGraph, don't pass it explicitly
-        if agent_name == "greeter":
-            result = greeter_agent_task(query, messages, user_id, model_name).result()
-        elif agent_name == "search":
-            result = search_agent_task(query, messages, user_id, model_name).result()
-        else:
-            # Fallback to greeter
-            result = greeter_agent_task(query, messages, user_id, model_name).result()
+        result = generic_agent_task(agent_name, query, messages, user_id, model_name).result()
         
         logger.info(f"[AGENT_WITH_TOOL_RESULTS] Agent task returned: has_reply={bool(result.reply)}, reply_preview={result.reply[:50] if result.reply else '(empty)'}..., tool_calls_count={len(result.tool_calls) if result.tool_calls else 0}")
         return result

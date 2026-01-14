@@ -15,7 +15,7 @@
 import React, { useEffect, useRef } from 'react'
 import type { Message } from '@/state/useChatStore'
 import type { PlanProposalData } from '@/components/PlanProposal'
-import MessageItem from './MessageItem'
+import MessageItem, { type MessageItemProps } from './MessageItem'
 
 interface MessageListProps {
   /** Array of messages to display */

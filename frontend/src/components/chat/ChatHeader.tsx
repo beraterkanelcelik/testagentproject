@@ -13,6 +13,7 @@
 
 import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import type { Message } from '@/state/useChatStore'
 
 interface Model {
   id: string
@@ -37,6 +38,8 @@ interface ChatHeaderProps {
   onDeleteChat: () => void
   /** Whether current session exists */
   hasCurrentSession: boolean
+  /** Messages for context usage display */
+  messages: Message[]
 }
 
 /**
@@ -58,11 +61,18 @@ export default function ChatHeader({
   onOpenStats,
   onDeleteChat,
   hasCurrentSession,
+  messages,
 }: ChatHeaderProps) {
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false)
   const [headerMoreMenuOpen, setHeaderMoreMenuOpen] = useState(false)
 
   const selectedModelName = availableModels.find(m => m.id === selectedModel)?.name || selectedModel
+  
+  // Get context usage from latest assistant message
+  const latestAssistantMessage = messages
+    .filter(msg => msg.role === 'assistant')
+    .slice(-1)[0]
+  const contextUsage = latestAssistantMessage?.context_usage
 
   return (
     <div className="px-4 py-1 flex items-center justify-between bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
@@ -79,23 +89,31 @@ export default function ChatHeader({
         </button>
         
         {/* Model Selection Dropdown */}
-        <div className="relative">
-          <button
-            onClick={() => setModelDropdownOpen(!modelDropdownOpen)}
-            className="flex items-center gap-1 px-2 py-0.5 hover:bg-muted rounded-md transition-colors text-sm"
-          >
-            <span className="font-medium">
-              {selectedModelName}
-            </span>
-            <svg 
-              className={`w-3 h-3 transition-transform ${modelDropdownOpen ? 'rotate-180' : ''}`}
-              fill="none" 
-              stroke="currentColor" 
-              viewBox="0 0 24 24"
+        <div className="relative flex items-center gap-2">
+          <div className="flex flex-col">
+            <button
+              onClick={() => setModelDropdownOpen(!modelDropdownOpen)}
+              className="flex items-center gap-1 px-2 py-0.5 hover:bg-muted rounded-md transition-colors text-sm"
             >
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
+              <span className="font-medium">
+                {selectedModelName}
+              </span>
+              <svg 
+                className={`w-3 h-3 transition-transform ${modelDropdownOpen ? 'rotate-180' : ''}`}
+                fill="none" 
+                stroke="currentColor" 
+                viewBox="0 0 24 24"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+            {/* Context Usage Display */}
+            {contextUsage && (
+              <div className="text-xs text-muted-foreground px-2">
+                {contextUsage.total_tokens.toLocaleString()} / {contextUsage.context_window.toLocaleString()} tokens ({contextUsage.usage_percentage}%)
+              </div>
+            )}
+          </div>
           
           {/* Model Dropdown Menu */}
           {modelDropdownOpen && (

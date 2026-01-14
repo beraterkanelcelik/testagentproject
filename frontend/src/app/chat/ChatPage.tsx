@@ -632,6 +632,14 @@ export default function ChatPage() {
                           ...msg,
                           ...(doneData.tokens_used && { tokens_used: doneData.tokens_used }),
                           ...(doneData.raw_tool_outputs && { raw_tool_outputs: doneData.raw_tool_outputs }),
+                          ...(doneData.context_usage && { context_usage: doneData.context_usage }),
+                          // Extract agent_name from done event (backend sends "agent" key)
+                          ...(doneData.agent && {
+                            metadata: {
+                              ...msg.metadata,
+                              agent_name: doneData.agent,
+                            },
+                          }),
                         }
                       : msg
                   ),
@@ -1201,6 +1209,14 @@ export default function ChatPage() {
                       ? {
                           ...msg,
                           ...(doneData.tokens_used && { tokens_used: doneData.tokens_used }),
+                          ...(doneData.context_usage && { context_usage: doneData.context_usage }),
+                          // Extract agent_name from done event (backend sends "agent" key)
+                          ...(doneData.agent && {
+                            metadata: {
+                              ...msg.metadata,
+                              agent_name: doneData.agent,
+                            },
+                          }),
                         }
                       : msg
                   ),
@@ -1332,6 +1348,7 @@ export default function ChatPage() {
               onOpenStats={handleOpenStats}
               onDeleteChat={handleDeleteCurrentChat}
               hasCurrentSession={!!currentSession}
+              messages={messages}
             />
 
             {/* Messages Area */}

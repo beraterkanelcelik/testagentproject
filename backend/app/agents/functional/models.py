@@ -54,3 +54,4 @@ class AgentResponse(BaseModel):
     clarification: Optional[str] = None
     plan: Optional[Dict[str, Any]] = None
     raw_tool_outputs: Optional[List[Dict[str, Any]]] = None
+    context_usage: Optional[Dict[str, Any]] = None  # NEW: Token context usage tracking

@@ -494,6 +494,7 @@ async def stream_agent(request):
                                 "raw_tool_outputs": response.get("raw_tool_outputs"),
                                 "agent": response.get("agent_name"),
                                 "tool_calls": response.get("tool_calls", []),
+                                "context_usage": response.get("context_usage"),
                             }
                             # Remove response field as it's now in data
                             event.pop("response", None)
@@ -737,85 +738,15 @@ async def approve_tool(request):
                 'error': f'Failed to send resume signal: {str(e)}'
             }, status=500)
         
-        # Block and wait for final response (non-streaming mode: wait for completion)
-        # This eliminates the need for frontend polling
-        from app.db.models.message import Message
-        from asgiref.sync import sync_to_async
-        import time
-        
-        WAIT_TIMEOUT_SECONDS = APPROVAL_WAIT_TIMEOUT_SECONDS
-        POLL_INTERVAL_SECONDS = 0.5
-        
-        # Get the user message ID that triggered this approval (for correlation)
-        # Find the most recent user message in this session
-        user_message = await sync_to_async(
-            lambda: Message.objects.filter(
-                session_id=chat_session_id,
-                role="user"
-            ).order_by('-created_at').first()
-        )()
-        
-        user_message_id = user_message.id if user_message else None
-        
-        start_time = time.time()
-        
-        # Poll for final assistant message (after tool execution completes)
-        while (time.time() - start_time) < WAIT_TIMEOUT_SECONDS:
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
-            
-            try:
-                # Find assistant message created after the user message (final response)
-                latest_assistant_msg = await sync_to_async(
-                    lambda: Message.objects.filter(
-                        session_id=chat_session_id,
-                        role="assistant"
-                    ).order_by('-created_at').first()
-                )()
-                
-                # Check if this is a new message (after the user message that triggered approval)
-                if latest_assistant_msg and user_message_id:
-                    # Check if this assistant message was created after the user message
-                    if latest_assistant_msg.id > user_message_id or latest_assistant_msg.created_at > user_message.created_at:
-                        # Check if it has content (final response, not just tool calls)
-                        metadata = latest_assistant_msg.metadata or {}
-                        tool_calls = metadata.get("tool_calls", [])
-                        has_content = latest_assistant_msg.content and latest_assistant_msg.content.strip()
-                        
-                        # If it has content, it's the final response
-                        if has_content:
-                            # Return final response directly (no polling needed in frontend)
-                            return JsonResponse({
-                                'success': True,
-                                'response': {
-                                    'reply': latest_assistant_msg.content or "",
-                                    'agent_name': metadata.get("agent_name", "assistant"),
-                                    'tool_calls': tool_calls,
-                                }
-                            })
-                elif latest_assistant_msg:
-                    # Fallback: if we can't correlate, check if message has content
-                    metadata = latest_assistant_msg.metadata or {}
-                    if latest_assistant_msg.content and latest_assistant_msg.content.strip():
-                        return JsonResponse({
-                            'success': True,
-                            'response': {
-                                'reply': latest_assistant_msg.content or "",
-                                'agent_name': metadata.get("agent_name", "assistant"),
-                                'tool_calls': metadata.get("tool_calls", []),
-                            }
-                        })
-                        
-            except Exception as e:
-                logger.debug(f"Error polling DB for final response after approval: {e}")
-                continue
-        
-        # Timeout - workflow might still be processing
-        logger.warning(f"[HITL] [RESUME] Timeout waiting for final response after approval: session={chat_session_id}")
+        # Return immediately - workflow will process asynchronously
+        # Frontend should listen to SSE stream or poll messages endpoint for updates
+        logger.info(f"[HITL] [RESUME] Approval signal sent successfully, returning immediately: session={chat_session_id}")
         return JsonResponse({
             'success': True,
-            'status': 'processing',
-            'message': 'Tool approved and executing. Response will be available shortly.',
-            'fetch': f"/api/chats/{chat_session_id}/messages/"
+            'status': 'approved',
+            'message': 'Tool approved. Workflow will continue processing. Listen to the SSE stream or poll messages endpoint for updates.',
+            'session_id': chat_session_id,
+            'messages_endpoint': f"/api/chats/{chat_session_id}/messages/"
         })
     
     except json.JSONDecodeError as e:

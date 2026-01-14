@@ -16,8 +16,6 @@ from app.agents.functional.tasks import (
     supervisor_task,
     load_messages_task,
     check_summarization_needed_task,
-    greeter_agent_task,
-    search_agent_task,
     agent_task,
     tool_execution_task,
     agent_with_tool_results_task,
@@ -29,133 +27,88 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 
-# Global checkpointer instance and context manager
-_checkpointer = None
+# Global checkpointer instance (long-lived for Django app lifecycle)
+_checkpointer: Optional[PostgresSaver] = None
 _checkpointer_cm = None
-
-
-class CheckpointerWrapper:
-    """
-    Wrapper for PostgresSaver that handles connection timeouts.
-    Recreates the checkpointer if connection is closed.
-    """
-    def __init__(self):
-        self._checkpointer = None
-        self._checkpointer_cm = None
-        self._recreate_checkpointer()
-    
-    def _recreate_checkpointer(self):
-        """Create a new checkpointer instance."""
-        try:
-            from app.settings import DATABASES
-            from langgraph.checkpoint.postgres import PostgresSaver
-            
-            db_config = DATABASES['default']
-            db_url = (
-                f"postgresql://{db_config['USER']}:{db_config['PASSWORD']}"
-                f"@{db_config['HOST']}:{db_config['PORT']}/{db_config['NAME']}"
-            )
-            
-            # PostgresSaver.from_conn_string() returns a context manager
-            # Enter it to get the actual checkpointer instance
-            self._checkpointer_cm = PostgresSaver.from_conn_string(db_url)
-            self._checkpointer = self._checkpointer_cm.__enter__()
-            
-            # Setup tables if needed
-            try:
-                self._checkpointer.setup()
-            except Exception:
-                pass  # Tables may already exist
-            
-            logger.info("Checkpointer created successfully")
-        except Exception as e:
-            logger.error(f"Failed to create checkpointer: {e}", exc_info=True)
-            self._checkpointer = None
-            self._checkpointer_cm = None
-    
-    def _get_checkpointer(self):
-        """Get checkpointer, recreating if connection is closed."""
-        if self._checkpointer is None:
-            self._recreate_checkpointer()
-        return self._checkpointer
-    
-    def __getattr__(self, name):
-        """Delegate all attribute access to the underlying checkpointer."""
-        checkpointer = self._get_checkpointer()
-        if checkpointer is None:
-            raise RuntimeError("Checkpointer is not available")
-        
-        try:
-            attr = getattr(checkpointer, name)
-        except AttributeError:
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-        
-        # Wrap methods to handle connection errors
-        if callable(attr):
-            def wrapper(*args, **kwargs):
-                # Get the method from the current checkpointer
-                current_checkpointer = self._get_checkpointer()
-                if current_checkpointer is None:
-                    raise RuntimeError("Checkpointer is not available")
-                
-                method = getattr(current_checkpointer, name)
-                
-                try:
-                    return method(*args, **kwargs)
-                except Exception as e:
-                    error_str = str(e).lower()
-                    # Check for connection-related errors
-                    if any(phrase in error_str for phrase in ['connection is closed', 'connection closed', 'the connection is closed']):
-                        logger.warning(f"Connection closed, recreating checkpointer: {e}")
-                        # Close old context manager if it exists
-                        if self._checkpointer_cm and hasattr(self._checkpointer_cm, '__exit__'):
-                            try:
-                                self._checkpointer_cm.__exit__(None, None, None)
-                            except Exception:
-                                pass
-                        self._recreate_checkpointer()
-                        # Retry once with new checkpointer
-                        current_checkpointer = self._get_checkpointer()
-                        if current_checkpointer:
-                            method = getattr(current_checkpointer, name)
-                            return method(*args, **kwargs)
-                    raise
-            return wrapper
-        return attr
 
 
 def get_checkpointer() -> Optional[PostgresSaver]:
     """
-    Get checkpointer instance (wrapper that handles connection timeouts).
+    Get checkpointer instance using LangGraph's built-in PostgresSaver.
+    
+    According to LangGraph Functional API best practices:
+    - PostgresSaver.from_conn_string() returns a context manager
+    - For web frameworks (Django), we create a long-lived instance at startup
+    - The checkpointer is reused throughout the application lifecycle
+    - setup() is called once to initialize database tables
+    
+    Reference: https://docs.langchain.com/oss/python/langgraph/how-tos/persistence_postgres/
     """
-    global _checkpointer
-    if _checkpointer is None:
-        _checkpointer = CheckpointerWrapper()
-    return _checkpointer
+    global _checkpointer, _checkpointer_cm
+
+    if _checkpointer is not None:
+        return _checkpointer
+
+    try:
+        from app.settings import DATABASES
+
+        db_config = DATABASES['default']
+        db_url = (
+            f"postgresql://{db_config['USER']}:{db_config['PASSWORD']}"
+            f"@{db_config['HOST']}:{db_config['PORT']}/{db_config['NAME']}"
+        )
+
+        # PostgresSaver.from_conn_string() returns a context manager
+        # For Django, we create a long-lived instance by entering the context manager
+        # This is the recommended pattern for web frameworks per LangGraph docs
+        _checkpointer_cm = PostgresSaver.from_conn_string(db_url)
+        _checkpointer = _checkpointer_cm.__enter__()
+
+        # Initialize database tables (required by LangGraph)
+        # This is safe to call multiple times - it only creates tables if they don't exist
+        try:
+            _checkpointer.setup()
+            logger.info("Checkpointer tables initialized successfully")
+        except Exception as e:
+            # Tables may already exist, or there might be a connection issue
+            logger.warning(f"Checkpointer setup warning (tables may already exist): {e}")
+
+        logger.info("Checkpointer created successfully")
+        return _checkpointer
+
+    except Exception as e:
+        logger.error(f"Failed to create checkpointer: {e}", exc_info=True)
+        return None
 
 
 def cleanup_checkpointer():
     """
-    HIGH-4: Cleanup checkpointer on application shutdown.
-    Ensures context manager __exit__ is called properly.
+    Cleanup checkpointer on application shutdown.
+    
+    Properly exits the context manager to close database connections.
+    This is registered with atexit to ensure cleanup on app shutdown.
     """
-    global _checkpointer
-    if _checkpointer and hasattr(_checkpointer, '_checkpointer_cm'):
+    global _checkpointer, _checkpointer_cm
+
+    if _checkpointer_cm is not None and _checkpointer is not None:
         try:
-            if _checkpointer._checkpointer_cm:
-                _checkpointer._checkpointer_cm.__exit__(None, None, None)
-                logger.info("Checkpointer cleaned up on shutdown")
+            # Properly exit the context manager to close connections
+            _checkpointer_cm.__exit__(None, None, None)
+            logger.info("Checkpointer cleaned up on shutdown")
         except Exception as e:
             logger.warning(f"Error cleaning up checkpointer: {e}")
+
+    _checkpointer = None
+    _checkpointer_cm = None
 
 
 # Register cleanup handler for application shutdown
 atexit.register(cleanup_checkpointer)
 
 
-# Create checkpointer instance for @entrypoint
-# Note: @entrypoint requires an actual checkpointer instance, not a context manager
-# We use a wrapper that automatically recreates the connection if it's closed
+# Create checkpointer instance for @entrypoint decorator
+# This is created at module import time for Django app lifecycle
+# According to LangGraph Functional API, checkpointer should be passed to @entrypoint
 _checkpointer_instance = get_checkpointer()
 
 # Auto-executable tools per agent
@@ -491,37 +444,18 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                 # Normal flow: invoke agent
                 # When resuming from interrupt, LangGraph will restore checkpointed state
                 # and interrupt() will return the resume payload (approval decisions)
-                # Route to appropriate agent
-                if routing.agent == "greeter":
-                    logger.info(f"[WORKFLOW] Routing to greeter agent for query_preview={routing.query[:50] if routing.query else '(empty)'}...")
-                    response = greeter_agent_task(
-                        query=routing.query,
-                        messages=messages,
-                        user_id=current_user_id,
-                        model_name=None,
-                        config=checkpoint_config
-                    ).result()
-                    logger.info(f"[WORKFLOW] Greeter agent returned: has_reply={bool(response.reply)}, reply_preview={response.reply[:50] if response.reply else '(empty)'}...")
-                elif routing.agent == "search":
-                    logger.info(f"[WORKFLOW] Routing to search agent for query_preview={routing.query[:50] if routing.query else '(empty)'}...")
-                    response = search_agent_task(
-                        query=routing.query,
-                        messages=messages,
-                        user_id=current_user_id,
-                        model_name=None,
-                        config=checkpoint_config
-                    ).result()
-                    logger.info(f"[WORKFLOW] Search agent returned: has_reply={bool(response.reply)}, reply_preview={response.reply[:50] if response.reply else '(empty)'}..., tool_calls_count={len(response.tool_calls) if response.tool_calls else 0}")
-                else:
-                    response = agent_task(
-                        agent_name=routing.agent,
-                        query=routing.query,
-                        messages=messages,
-                        user_id=current_user_id,
-                        tool_results=None,
-                        model_name=None,
-                        config=checkpoint_config
-                    ).result()
+                # Use generic agent task (no hardcoded routing)
+                logger.info(f"[WORKFLOW] Routing to {routing.agent} agent for query_preview={routing.query[:50] if routing.query else '(empty)'}...")
+                response = agent_task(
+                    agent_name=routing.agent,
+                    query=routing.query,
+                    messages=messages,
+                    user_id=current_user_id,
+                    tool_results=None,
+                    model_name=None,
+                    config=checkpoint_config
+                ).result()
+                logger.info(f"[WORKFLOW] {routing.agent} agent returned: has_reply={bool(response.reply)}, reply_preview={response.reply[:50] if response.reply else '(empty)'}..., tool_calls_count={len(response.tool_calls) if response.tool_calls else 0}")
             else:
                 # Resume with pending tool_calls - reconstruct response from stored tool_calls
                 # Get routing agent from last assistant message or response metadata
@@ -572,9 +506,6 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
             # 1. auto_tools: safe to auto-execute
             # 2. approval_tools: require human approval (interrupt)
             # 3. manual_tools: not auto-exec, but also not approval-required (execute immediately)
-            auto_tools = []
-            approval_tools = []
-            manual_tools = []
             
             # Get routing agent for tool partitioning
             # On resume with pending_tool_calls, routing might not be defined
@@ -585,14 +516,11 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                 # Fallback to agent_name from response
                 routing_agent = response.agent_name if hasattr(response, 'agent_name') and response.agent_name else "greeter"
             
-            for tc in response.tool_calls:
-                tool_name = tc.get("name") or tc.get("tool", "")
-                if is_auto_executable(tool_name, routing_agent):
-                    auto_tools.append(tc)
-                elif tool_requires_approval(tool_name):
-                    approval_tools.append(tc)
-                else:
-                    manual_tools.append(tc)
+            # Use helper function to partition tools
+            partitioned = partition_tools(response.tool_calls, routing_agent)
+            auto_tools = partitioned["auto"]
+            approval_tools = partitioned["approval"]
+            manual_tools = partitioned["manual"]
             
             logger.info(f"[WORKFLOW] Tool partitioning: auto={len(auto_tools)} approval={len(approval_tools)} manual={len(manual_tools)} session={current_session_id}")
             
@@ -900,6 +828,25 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                 parent_message_id=current_parent_message_id
             ).result()
         
+        # Calculate context usage for frontend display
+        try:
+            from app.agents.context_usage import calculate_context_usage
+            # Get model name from session or use default
+            model_name = None
+            if current_session_id:
+                try:
+                    from app.db.models.session import ChatSession
+                    session = ChatSession.objects.get(id=current_session_id)
+                    if session.model_used:
+                        model_name = session.model_used
+                except Exception:
+                    pass
+            # Calculate and add context usage to response
+            context_usage = calculate_context_usage(messages, model_name)
+            response.context_usage = context_usage
+        except Exception as e:
+            logger.warning(f"Failed to calculate context usage: {e}", exc_info=True)
+        
         # Update trace with final response
         if trace_span:
             try:
@@ -953,6 +900,127 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
             reply=f"I apologize, but I encountered an error: {str(e)}",
             agent_name="system"
         )
+
+
+def extract_response_from_chunk(chunk: Any) -> Optional[AgentResponse]:
+    """
+    Extract AgentResponse from LangGraph stream chunk.
+    Handles multiple chunk formats returned by Functional API.
+    
+    Args:
+        chunk: Stream chunk from LangGraph (can be dict, AgentResponse, etc.)
+        
+    Returns:
+        AgentResponse if extracted successfully, None otherwise
+    """
+    if isinstance(chunk, AgentResponse):
+        return chunk
+    
+    if isinstance(chunk, dict):
+        # Check for 'ai_agent_workflow' key
+        if 'ai_agent_workflow' in chunk:
+            response_data = chunk['ai_agent_workflow']
+            logger.debug(f"[STREAM_CHUNK] Found 'ai_agent_workflow' key, response_data type={type(response_data)}")
+            if isinstance(response_data, AgentResponse):
+                logger.info(f"[STREAM_CHUNK] Extracted AgentResponse from 'ai_agent_workflow' key: agent={response_data.agent_name}, has_reply={bool(response_data.reply)}")
+                return response_data
+            elif isinstance(response_data, dict):
+                # Try to construct AgentResponse from dict
+                try:
+                    response = AgentResponse(**response_data)
+                    logger.info(f"[STREAM_CHUNK] Constructed AgentResponse from dict: agent={response.agent_name}, has_reply={bool(response.reply)}")
+                    return response
+                except Exception as e:
+                    logger.warning(f"[STREAM_CHUNK] Failed to construct AgentResponse from dict: {e}")
+        
+        # Check if chunk itself is response dict
+        elif any(key in chunk for key in ['agent_name', 'reply', 'tool_calls', 'type']):
+            try:
+                response = AgentResponse(**chunk)
+                logger.info(f"[STREAM_CHUNK] Constructed AgentResponse from chunk dict: agent={response.agent_name}, has_reply={bool(response.reply)}")
+                return response
+            except Exception as e:
+                logger.warning(f"[STREAM_CHUNK] Failed to construct AgentResponse from chunk: {e}, chunk_keys={list(chunk.keys())}")
+    
+    return None
+
+
+def extract_interrupt_value(interrupt_raw: Any) -> Dict[str, Any]:
+    """
+    Extract interrupt value from LangGraph Interrupt object.
+    Handles multiple formats: tuple, Interrupt object, dict, list.
+    
+    Args:
+        interrupt_raw: Raw interrupt object from LangGraph (various formats)
+        
+    Returns:
+        Dict with interrupt data (tool_approval info, etc.)
+    """
+    # Handle tuple format (most common from LangGraph)
+    if isinstance(interrupt_raw, tuple) and len(interrupt_raw) > 0:
+        interrupt_obj = interrupt_raw[0]
+        if hasattr(interrupt_obj, 'value'):
+            return interrupt_obj.value
+        elif isinstance(interrupt_obj, dict) and 'value' in interrupt_obj:
+            return interrupt_obj['value']
+    
+    # Handle direct Interrupt object
+    if hasattr(interrupt_raw, 'value'):
+        return interrupt_raw.value
+    
+    # Handle dict format
+    if isinstance(interrupt_raw, dict):
+        if 'value' in interrupt_raw:
+            return interrupt_raw['value']
+        elif interrupt_raw.get('type') == 'tool_approval':
+            return interrupt_raw
+    
+    # Handle list format (serialized tuple)
+    if isinstance(interrupt_raw, list) and len(interrupt_raw) > 0:
+        first_item = interrupt_raw[0]
+        if isinstance(first_item, dict):
+            if 'value' in first_item:
+                return first_item['value']
+            elif first_item.get('type') == 'tool_approval':
+                return first_item
+    
+    # Fallback: return raw data if we couldn't extract value
+    logger.warning(f"[HITL] [INTERRUPT] Could not extract interrupt value, using raw data: {type(interrupt_raw)}")
+    return interrupt_raw if isinstance(interrupt_raw, dict) else {}
+
+
+def partition_tools(
+    tool_calls: List[Dict[str, Any]], 
+    agent_name: str
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Partition tools into auto-executable, approval-required, and manual buckets.
+    
+    Args:
+        tool_calls: List of tool call dictionaries
+        agent_name: Name of the agent (for auto-executable check)
+        
+    Returns:
+        Dict with keys: 'auto', 'approval', 'manual' containing partitioned tool calls
+    """
+    auto_tools = []
+    approval_tools = []
+    manual_tools = []
+    
+    for tc in tool_calls:
+        tool_name = tc.get("name") or tc.get("tool", "")
+        if is_auto_executable(tool_name, agent_name):
+            auto_tools.append(tc)
+        elif tool_requires_approval(tool_name):
+            approval_tools.append(tc)
+        else:
+            manual_tools.append(tc)
+    
+    return {
+        "auto": auto_tools,
+        "approval": approval_tools,
+        "manual": manual_tools
+    }
 
 
 def _execute_plan_workflow(
@@ -1051,9 +1119,16 @@ def _execute_plan_workflow(
                     })
                     
                     # Add tool result as ToolMessage
+                    # Generate proper tool_call_id (consistent with main workflow UUID-based approach)
+                    import uuid
+                    tool_call_id = tool_result.tool_call_id
+                    if not tool_call_id:
+                        # Generate UUID-based ID (consistent with main workflow pattern)
+                        tool_call_id = f"call_{uuid.uuid4().hex[:16]}"
+                    
                     tool_msg = ToolMessage(
                         content=str(tool_result.output) if tool_result.output else tool_result.error,
-                        tool_call_id=f"{tool_result.tool}_{hash(str(tool_result.args))}",
+                        tool_call_id=tool_call_id,
                         name=tool_result.tool
                     )
                     messages = messages + [tool_msg]
@@ -1166,12 +1241,12 @@ async def ai_agent_workflow_events(request: Union[AgentRequest, Command], sessio
     # If Command, use provided session_id/user_id/trace_id (should be passed from runner)
     
     # Status messages mapping
+    # Note: Task names match @task function names for EventCallbackHandler
     status_messages = {
         "supervisor_task": "Routing to agent...",
         "load_messages_task": "Loading conversation history...",
         "check_summarization_needed_task": "Checking if summarization needed...",
-        "greeter_agent_task": "Processing with greeter agent...",
-        "search_agent_task": "Searching documents...",
+        "generic_agent_task": "Processing with agent...",
         "agent_task": "Processing with agent...",
         "tool_execution_task": "Executing tools...",
         "agent_with_tool_results_task": "Processing tool results...",
@@ -1269,34 +1344,10 @@ async def ai_agent_workflow_events(request: Union[AgentRequest, Command], sessio
                                     logger.info(f"[HITL] [INTERRUPT] Detected __interrupt__ in stream chunk session={session_id}")
                                     break
                                 
-                                # chunk is a state dictionary
-                                # The final chunk contains the AgentResponse
-                                if isinstance(chunk, dict):
-                                    # Check if this chunk contains the response
-                                    # LangGraph Functional API may return response under different keys
-                                    if 'ai_agent_workflow' in chunk:
-                                        response_data = chunk['ai_agent_workflow']
-                                        logger.debug(f"[STREAM_CHUNK] Found 'ai_agent_workflow' key, response_data type={type(response_data)}")
-                                        if isinstance(response_data, AgentResponse):
-                                            final_response_holder[0] = response_data
-                                            logger.info(f"[STREAM_CHUNK] Extracted AgentResponse from 'ai_agent_workflow' key: agent={response_data.agent_name}, has_reply={bool(response_data.reply)}")
-                                        elif isinstance(response_data, dict):
-                                            # Try to construct AgentResponse from dict
-                                            try:
-                                                final_response_holder[0] = AgentResponse(**response_data)
-                                                logger.info(f"[STREAM_CHUNK] Constructed AgentResponse from dict: agent={final_response_holder[0].agent_name}, has_reply={bool(final_response_holder[0].reply)}")
-                                            except Exception as e:
-                                                logger.warning(f"[STREAM_CHUNK] Failed to construct AgentResponse from dict: {e}")
-                                    elif any(key in chunk for key in ['agent_name', 'reply', 'tool_calls', 'type']):
-                                        # Might be the response directly as a dict
-                                        try:
-                                            final_response_holder[0] = AgentResponse(**chunk)
-                                            logger.info(f"[STREAM_CHUNK] Constructed AgentResponse from chunk dict: agent={final_response_holder[0].agent_name}, has_reply={bool(final_response_holder[0].reply)}")
-                                        except Exception as e:
-                                            logger.warning(f"[STREAM_CHUNK] Failed to construct AgentResponse from chunk: {e}, chunk_keys={list(chunk.keys())}")
-                                elif isinstance(chunk, AgentResponse):
-                                    final_response_holder[0] = chunk
-                                    logger.info(f"[STREAM_CHUNK] Chunk is AgentResponse directly: agent={chunk.agent_name}, has_reply={bool(chunk.reply)}")
+                                # Extract response from chunk using helper function
+                                extracted_response = extract_response_from_chunk(chunk)
+                                if extracted_response:
+                                    final_response_holder[0] = extracted_response
                             
                             if final_response_holder[0]:
                                 logger.info(f"[STREAM_CHUNK] Final response extracted successfully: agent={final_response_holder[0].agent_name}, type={final_response_holder[0].type}, has_reply={bool(final_response_holder[0].reply)}")
@@ -1333,37 +1384,10 @@ async def ai_agent_workflow_events(request: Union[AgentRequest, Command], sessio
                         logger.info(f"[HITL] [INTERRUPT] Detected __interrupt__ in stream chunk session={session_id}")
                         break
                     
-                    # chunk is a state dictionary
-                    # The final chunk contains the AgentResponse
-                    if isinstance(chunk, dict):
-                        # Check if this chunk contains the response
-                        # LangGraph Functional API may return response under different keys
-                        if 'ai_agent_workflow' in chunk:
-                            response_data = chunk['ai_agent_workflow']
-                            logger.debug(f"[STREAM_CHUNK] Found 'ai_agent_workflow' key, response_data type={type(response_data)}")
-                            if isinstance(response_data, AgentResponse):
-                                final_response_holder[0] = response_data
-                                logger.info(f"[STREAM_CHUNK] Extracted AgentResponse from 'ai_agent_workflow' key: agent={response_data.agent_name}, has_reply={bool(response_data.reply)}")
-                            elif isinstance(response_data, dict):
-                                # Try to construct AgentResponse from dict
-                                try:
-                                    final_response_holder[0] = AgentResponse(**response_data)
-                                    logger.info(f"[STREAM_CHUNK] Constructed AgentResponse from dict: agent={final_response_holder[0].agent_name}, has_reply={bool(final_response_holder[0].reply)}")
-                                except Exception as e:
-                                    logger.warning(f"[STREAM_CHUNK] Failed to construct AgentResponse from dict: {e}")
-                        elif isinstance(chunk, AgentResponse):
-                            final_response_holder[0] = chunk
-                            logger.info(f"[STREAM_CHUNK] Chunk is AgentResponse directly: agent={chunk.agent_name}, has_reply={bool(chunk.reply)}")
-                        elif any(key in chunk for key in ['agent_name', 'reply', 'tool_calls', 'type']):
-                            # Might be the response directly as a dict
-                            try:
-                                final_response_holder[0] = AgentResponse(**chunk)
-                                logger.info(f"[STREAM_CHUNK] Constructed AgentResponse from chunk dict: agent={final_response_holder[0].agent_name}, has_reply={bool(final_response_holder[0].reply)}")
-                            except Exception as e:
-                                logger.warning(f"[STREAM_CHUNK] Failed to construct AgentResponse from chunk: {e}, chunk_keys={list(chunk.keys())}")
-                    elif isinstance(chunk, AgentResponse):
-                        final_response_holder[0] = chunk
-                        logger.info(f"[STREAM_CHUNK] Chunk is AgentResponse directly: agent={chunk.agent_name}, has_reply={bool(chunk.reply)}")
+                    # Extract response from chunk using helper function
+                    extracted_response = extract_response_from_chunk(chunk)
+                    if extracted_response:
+                        final_response_holder[0] = extracted_response
                 
                 if final_response_holder[0]:
                     logger.info(f"[STREAM_CHUNK] Final response extracted successfully: agent={final_response_holder[0].agent_name}, type={final_response_holder[0].type}, has_reply={bool(final_response_holder[0].reply)}")
@@ -1443,41 +1467,8 @@ async def ai_agent_workflow_events(request: Union[AgentRequest, Command], sessio
     if interrupt_holder[0]:
         logger.info(f"[HITL] [INTERRUPT] Yielding interrupt event session={session_id}")
         
-        # Extract interrupt value from LangGraph Interrupt object
-        # LangGraph returns __interrupt__ as a tuple: (Interrupt(value={...}, id='...'),)
-        # When serialized to JSON, tuple becomes array, Interrupt becomes dict with 'value' and 'id'
-        interrupt_raw = interrupt_holder[0]
-        interrupt_data = None
-        
-        # Handle tuple format (most common from LangGraph)
-        if isinstance(interrupt_raw, tuple) and len(interrupt_raw) > 0:
-            interrupt_obj = interrupt_raw[0]
-            # Interrupt object has .value attribute
-            if hasattr(interrupt_obj, 'value'):
-                interrupt_data = interrupt_obj.value
-            elif isinstance(interrupt_obj, dict) and 'value' in interrupt_obj:
-                interrupt_data = interrupt_obj['value']
-        # Handle direct Interrupt object
-        elif hasattr(interrupt_raw, 'value'):
-            interrupt_data = interrupt_raw.value
-        # Handle dict format (already serialized)
-        elif isinstance(interrupt_raw, dict):
-            if 'value' in interrupt_raw:
-                interrupt_data = interrupt_raw['value']
-            elif interrupt_raw.get('type') == 'tool_approval':
-                interrupt_data = interrupt_raw
-        # Handle list format (serialized tuple)
-        elif isinstance(interrupt_raw, list) and len(interrupt_raw) > 0:
-            first_item = interrupt_raw[0]
-            if isinstance(first_item, dict) and 'value' in first_item:
-                interrupt_data = first_item['value']
-            elif isinstance(first_item, dict) and first_item.get('type') == 'tool_approval':
-                interrupt_data = first_item
-        
-        # Fallback: use raw data if we couldn't extract value
-        if interrupt_data is None:
-            logger.warning(f"[HITL] [INTERRUPT] Could not extract interrupt value, using raw data: {type(interrupt_raw)}")
-            interrupt_data = interrupt_raw
+        # Extract interrupt value using helper function
+        interrupt_data = extract_interrupt_value(interrupt_holder[0])
         
         yield {
             "type": "interrupt",

@@ -25,9 +25,9 @@ import type { Message } from '@/state/useChatStore'
 import MarkdownMessage from '@/components/MarkdownMessage'
 import PlanProposal, { type PlanProposalData } from '@/components/PlanProposal'
 import JsonViewer from '@/components/JsonViewer'
-import ToolCallItem from './ToolCallItem'
+import ToolCallItem, { type ToolCallItemProps } from './ToolCallItem'
 
-interface MessageItemProps {
+export interface MessageItemProps {
   /** The message to render */
   message: Message
   /** All messages (for checking previous message type) */

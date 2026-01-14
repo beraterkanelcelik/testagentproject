@@ -143,13 +143,16 @@ export function useToolApproval({
         resume: resumePayload
       })
       
-      console.log(`[HITL] [REVIEW] Approval response received: success=${response.data.success} session=${currentSession.id}`)
+      console.log(`[HITL] [REVIEW] Approval response received: success=${response.data.success} status=${response.data.status} session=${currentSession.id}`)
       
       if (response.data.success) {
-        console.log(`[HITL] [REVIEW] Tool approved and executed successfully: tool=${toolName} result_preview=${String(response.data.response?.reply || '').substring(0, 100)} session=${currentSession.id}`)
+        // Backend now returns immediately after sending resume signal (non-blocking)
+        // The tool call status should already be "approved" from the optimistic update
+        // SSE stream will deliver the final response and update tool call to "completed"
         
-        // Update the tool call with the result (aligned with LangGraph Command pattern)
-        // This is equivalent to resuming with Command(resume=result) in LangGraph
+        console.log(`[HITL] [REVIEW] Tool approval signal sent successfully: tool=${toolName} session=${currentSession.id}`)
+        
+        // Ensure tool call is marked as approved (optimistic update already did this, but ensure consistency)
         updateMessages((messages) => {
           return messages.map((m: Message) => {
             if (m.id === messageId) {
@@ -164,12 +167,12 @@ export function useToolApproval({
                   (tc.id === toolCall.id && tc.name === toolName)
                 )
                 
-                if (matches) {
-                  console.log(`[HITL] [REVIEW] Updating tool call status: tool_call_id=${tcActualId} from approved to completed session=${currentSession.id}`)
+                if (matches && tc.status !== 'completed') {
+                  // Keep as approved - SSE will update to completed when result arrives
+                  console.log(`[HITL] [REVIEW] Tool call approved, waiting for execution: tool_call_id=${tcActualId} session=${currentSession.id}`)
                   return {
                     ...tc,
-                    status: 'completed',
-                    result: response.data.response?.reply || response.data.result,
+                    status: 'approved', // Will be updated to 'completed' by SSE stream
                     requires_approval: false
                   }
                 }
