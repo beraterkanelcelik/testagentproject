@@ -36,6 +36,7 @@ urlpatterns = [
     
     # Documents
     path('api/documents/', documents.documents, name='documents'),
+    path('api/documents/stream/', documents.stream_document_status, name='stream_document_status'),
     path('api/documents/<int:document_id>/', documents.document_detail, name='document_detail'),
     path('api/documents/<int:document_id>/file/', documents.document_file, name='document_file'),
     path('api/documents/<int:document_id>/chunks/', documents.document_chunks, name='document_chunks'),

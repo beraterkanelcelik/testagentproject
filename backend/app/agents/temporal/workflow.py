@@ -14,6 +14,33 @@ from collections import deque
 # Import activity - sandbox restrictions configured in worker to allow this
 from app.agents.temporal.activity import run_chat_activity
 
+
+@workflow.defn
+class DocumentProcessingWorkflow:
+    """
+    Legacy workflow class stub for backward compatibility.
+    
+    This workflow class no longer exists but old executions may still be in Temporal.
+    This stub immediately terminates to allow graceful cleanup of old workflows.
+    """
+    
+    @workflow.run
+    async def run(self, *args, **kwargs) -> Dict[str, Any]:
+        """
+        Terminate immediately - this is a legacy workflow that should not run.
+        
+        Accepts any arguments for backward compatibility with old workflow executions.
+        """
+        workflow.logger.warning(
+            f"[LEGACY_WORKFLOW] DocumentProcessingWorkflow is deprecated, terminating immediately. "
+            f"Workflow ID: {workflow.info().workflow_id}, Run ID: {workflow.info().run_id}"
+        )
+        return {
+            "status": "terminated",
+            "reason": "legacy_workflow_deprecated",
+            "workflow_id": workflow.info().workflow_id,
+        }
+
 # Read timeout from environment variable directly (cannot import from app.settings due to sandbox restrictions)
 # Workflows must be deterministic and cannot import Django settings which may have side effects
 TEMPORAL_APPROVAL_TIMEOUT_MINUTES = int(os.getenv('TEMPORAL_APPROVAL_TIMEOUT_MINUTES', '10'))
@@ -66,6 +93,8 @@ class ChatWorkflow:
         self.processed_messages: set = set()
         # Track resume payload for interrupt resume (human-in-the-loop)
         self.resume_payload: Optional[Any] = None
+        # Track last activity result for query
+        self.last_activity_result: Optional[Dict[str, Any]] = None
     
     @workflow.signal
     def new_message(self, message: str, plan_steps: Optional[list] = None, flow: str = "main", run_id: Optional[str] = None, parent_message_id: Optional[int] = None) -> None:
@@ -358,6 +387,14 @@ class ChatWorkflow:
                                 f"to prevent unbounded growth for session {chat_id}"
                             )
                             self.processed_messages.clear()
+                    
+                    # Store activity result for query
+                    self.last_activity_result = {
+                        "status": result.get("status") if isinstance(result, dict) else "unknown",
+                        "timestamp": workflow.now().timestamp(),
+                        "event_count": result.get("event_count", 0) if isinstance(result, dict) else 0,
+                        "has_response": result.get("has_response", False) if isinstance(result, dict) else False,
+                    }
                     
                     # Update last activity time after successful processing
                     self.last_activity_time = workflow.now().timestamp()

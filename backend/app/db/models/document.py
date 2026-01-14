@@ -11,6 +11,7 @@ class Document(models.Model):
     
     class Status(models.TextChoices):
         UPLOADED = 'UPLOADED', 'Uploaded'
+        QUEUED = 'QUEUED', 'Queued'  # Waiting in Temporal queue
         EXTRACTED = 'EXTRACTED', 'Extracted'
         INDEXING = 'INDEXING', 'Indexing'
         READY = 'READY', 'Ready'

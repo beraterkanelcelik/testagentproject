@@ -11,13 +11,23 @@ django.setup()
 
 import asyncio
 import signal
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from temporalio.client import Client
 from temporalio.service import RetryConfig, KeepAliveConfig
 from temporalio.worker import Worker
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
-from app.agents.temporal.workflow import ChatWorkflow
+from app.agents.temporal.workflow import ChatWorkflow, DocumentProcessingWorkflow
 from app.agents.temporal.activity import run_chat_activity
+from app.documents.temporal.workflow import DocumentQueueWorkflow
+from app.documents.temporal.activity import (
+    extract_text_activity,
+    chunk_text_activity,
+    embed_chunks_activity,
+    upsert_vectors_activity,
+    update_document_status_activity,
+    check_and_publish_queue_complete_activity,
+)
 from app.settings import TEMPORAL_ADDRESS, TEMPORAL_TASK_QUEUE
 from app.core.logging import get_logger
 
@@ -99,7 +109,9 @@ async def run_worker():
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
     
-    worker = None
+    chat_worker = None
+    doc_worker = None
+    activity_executor = None
     try:
         # Connect with retry logic
         client = await connect_with_retry()
@@ -110,6 +122,7 @@ async def run_worker():
         # This allows workflows to import activities without triggering sandbox violations
         restrictions = SandboxRestrictions.default.with_passthrough_modules(
             "app.agents.temporal.activity",
+            "app.documents.temporal.activity",
             "app.core.redis",
             "app.core.logging",
             "app.agents.functional.workflow",
@@ -119,24 +132,62 @@ async def run_worker():
             "django.core",
         )
         
-        worker = Worker(
+        # Create thread pool executor for synchronous activities
+        # Document processing activities are synchronous (Django ORM, file I/O)
+        # Chat activity is async (streaming, Redis pub/sub)
+        # Reduced from 50 to 10 to save memory (each thread uses ~10-50MB)
+        max_workers = 10
+        activity_executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="temporal-activity"
+        )
+        
+        # Create chat worker (for chat workflows)
+        # Include DocumentProcessingWorkflow for backward compatibility with old executions
+        chat_worker = Worker(
             client,
             task_queue=TEMPORAL_TASK_QUEUE,
-            workflows=[ChatWorkflow],
+            workflows=[ChatWorkflow, DocumentProcessingWorkflow],
             activities=[run_chat_activity],
-            # Configure worker concurrency (default is 100, adjust based on resources)
-            max_concurrent_workflow_tasks=50,
-            max_concurrent_activities=50,
+            # Configure worker concurrency (reduced to save memory)
+            max_concurrent_workflow_tasks=5,
+            max_concurrent_activities=max_workers,
+            # Thread pool executor for synchronous activities
+            activity_executor=activity_executor,
             # Use custom sandbox restrictions
             workflow_runner=SandboxedWorkflowRunner(restrictions=restrictions),
         )
         
-        logger.info("Worker started, waiting for tasks...")
+        # Create document worker
+        # Each document gets its own workflow instance for parallel processing
+        doc_worker = Worker(
+            client,
+            task_queue="document-queue",
+            workflows=[DocumentQueueWorkflow],
+            activities=[
+                extract_text_activity,
+                chunk_text_activity,
+                embed_chunks_activity,
+                upsert_vectors_activity,
+                update_document_status_activity,
+                check_and_publish_queue_complete_activity,
+            ],
+            # Configure worker concurrency: allow multiple document workflows to run in parallel
+            max_concurrent_workflow_tasks=2,  # Increased to handle multiple documents concurrently
+            max_concurrent_activities=max_workers,  # Activities can run in parallel within a workflow
+            # Thread pool executor for synchronous activities
+            activity_executor=activity_executor,
+            # Use custom sandbox restrictions
+            workflow_runner=SandboxedWorkflowRunner(restrictions=restrictions),
+        )
         
-        # Run worker until shutdown signal
+        logger.info(f"Workers started: chat queue={TEMPORAL_TASK_QUEUE}, document queue=document-queue")
+        
+        # Run all workers concurrently
         try:
+            workers_to_run = [chat_worker.run(), doc_worker.run()]
             await asyncio.gather(
-                worker.run(),
+                *workers_to_run,
                 shutdown_event.wait()
             )
         except asyncio.CancelledError:
@@ -149,13 +200,27 @@ async def run_worker():
         sys.exit(1)
     finally:
         # Graceful shutdown: wait for in-flight activities to complete
-        if worker:
-            logger.info("Shutting down worker gracefully...")
+        if chat_worker:
+            logger.info("Shutting down chat worker gracefully...")
             try:
-                await worker.shutdown()
-                logger.info("Worker shutdown complete")
+                await chat_worker.shutdown()
+                logger.info("Chat worker shutdown complete")
             except Exception as e:
-                logger.error(f"Error during worker shutdown: {e}", exc_info=True)
+                logger.error(f"Error during chat worker shutdown: {e}", exc_info=True)
+        
+        if doc_worker:
+            logger.info("Shutting down document worker gracefully...")
+            try:
+                await doc_worker.shutdown()
+                logger.info("Document worker shutdown complete")
+            except Exception as e:
+                logger.error(f"Error during document worker shutdown: {e}", exc_info=True)
+        
+        # Shutdown thread pool executor
+        if activity_executor:
+            logger.info("Shutting down activity executor...")
+            activity_executor.shutdown(wait=True)
+            logger.info("Activity executor shutdown complete")
 
 
 if __name__ == "__main__":

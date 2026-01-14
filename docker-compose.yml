@@ -8,6 +8,11 @@ services:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
       POSTGRES_INITDB_ARGS: "-E UTF8"
+      # Limit PostgreSQL shared memory and work memory to reduce RAM usage
+      POSTGRES_SHARED_BUFFERS: 256MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 512MB
+      POSTGRES_MAINTENANCE_WORK_MEM: 64MB
+      POSTGRES_WORK_MEM: 16MB
     ports:
       - "5432:5432"
     volumes:
@@ -21,6 +26,9 @@ services:
     restart: unless-stopped
     networks:
       - app-network
+    # Memory limits for database (was unlimited, now limited to 1GB)
+    mem_limit: 1g
+    mem_reservation: 512m
 
   # Django Backend
   backend:
@@ -64,9 +72,9 @@ services:
     tty: true
     networks:
       - app-network
-    # Memory limits (using mem_limit for regular compose, not Swarm)
-    mem_limit: 2g
-    mem_reservation: 1g
+    # Memory limits (reduced from 2g to 1g to save RAM)
+    mem_limit: 1g
+    mem_reservation: 512m
     # Hot-reload disabled - restart container manually for code changes
     command: sh -c "python manage.py migrate --noinput && uvicorn app.asgi:application --host 0.0.0.0 --port 8000 --workers 1 --limit-max-requests 1000"
 
@@ -94,9 +102,9 @@ services:
     restart: unless-stopped
     networks:
       - app-network
-    # Memory limits (using mem_limit for regular compose, not Swarm)
-    mem_limit: 2g
-    mem_reservation: 1g
+    # Memory limits (reduced from 2g to 1g to save RAM)
+    mem_limit: 1g
+    mem_reservation: 512m
 
   # Nginx (Reverse Proxy - Optional for production)
   nginx:
@@ -426,9 +434,9 @@ services:
       - /app/__pycache__
     networks:
       - app-network
-    # Memory limits (using mem_limit for regular compose, not Swarm)
-    mem_limit: 2g
-    mem_reservation: 1g
+    # Memory limits (reduced from 2g to 1g to save RAM)
+    mem_limit: 1g
+    mem_reservation: 512m
     command: python -m app.agents.temporal.worker
 
 volumes:

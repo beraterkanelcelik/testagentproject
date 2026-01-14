@@ -3,17 +3,21 @@ Document management endpoints (upload, list, delete).
 """
 import json
 import hashlib
-from django.http import JsonResponse
+import asyncio
+from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.clickjacking import xframe_options_exempt
 from django.core.paginator import Paginator
 from django.conf import settings
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_current_user_async
+from app.core.redis import get_redis_client
 from app.db.models.document import Document
 from app.documents.services.storage import storage_service
-from app.rag.pipelines.index_pipeline import index_document
+from app.rag.vectorstore import PgVectorStore
+from app.documents.temporal.workflow_manager import signal_add_document
 from app.core.logging import get_logger
+from app.settings import TEMPORAL_ADDRESS, TEMPORAL_TASK_QUEUE, SSE_HEARTBEAT_SECONDS, STREAM_TIMEOUT_SECONDS
 
 logger = get_logger(__name__)
 
@@ -130,12 +134,57 @@ def documents(request):
             else:
                 logger.debug(f"File saved successfully: {file_path}")
             
-            # Trigger indexing (synchronous for now, can be async later)
+            # Update status to QUEUED (waiting in Temporal queue)
+            document.status = Document.Status.QUEUED
+            document.save(update_fields=['status'])
+            
+            # Send signal to document queue workflow to add document to processing queue
             try:
-                index_document(document.id, user.id)
+                # Run async signal in new event loop (sync Django view context)
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                # Async function to publish status and send signal
+                async def publish_and_signal():
+                    # Publish initial QUEUED status
+                    try:
+                        from app.core.redis import get_redis_client
+                        redis_client = await get_redis_client()
+                        if redis_client:
+                            channel = f"documents:{user.id}"
+                            event = {
+                                "type": "status_update",
+                                "data": {
+                                    "document_id": document.id,
+                                    "status": "QUEUED",
+                                }
+                            }
+                            await redis_client.publish(channel, json.dumps(event).encode('utf-8'))
+                    except Exception as e:
+                        logger.debug(f"Failed to publish QUEUED status: {e}")
+                    
+                    # Send signal to add document to queue
+                    await signal_add_document(document.id, user.id)
+                
+                if loop.is_running():
+                    # If loop is already running, use a thread to run the async function
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(
+                            lambda: asyncio.run(publish_and_signal())
+                        )
+                        future.result(timeout=10)  # 10 second timeout for sending signal
+                else:
+                    # Use existing loop
+                    loop.run_until_complete(publish_and_signal())
+                
+                logger.info(f"Sent signal to add document {document.id} to processing queue")
             except Exception as e:
-                logger.error(f"Indexing failed for document {document.id}: {str(e)}")
-                # Document is created but indexing failed - status will be FAILED
+                logger.error(f"Failed to send signal for document {document.id}: {str(e)}", exc_info=True)
+                # Document is created but signal failed - status will remain QUEUED
             
             # Refresh from DB to get updated status
             document.refresh_from_db()
@@ -204,7 +253,11 @@ def document_detail(request, document_id):
             if document.file:
                 storage_service.delete_file(document.file.name)
             
-            # Delete document (cascades to chunks and embeddings)
+            # Explicitly delete embeddings from vector store
+            vector_store = PgVectorStore()
+            vector_store.delete_by_document(document_id)
+            
+            # Delete document (cascades to chunks, embeddings, and extracted text)
             document.delete()
             
             return JsonResponse({'message': 'Document deleted successfully'}, status=200)
@@ -390,7 +443,7 @@ def document_file(request, document_id):
 @csrf_exempt
 @require_http_methods(["POST"])
 def document_index(request, document_id):
-    """Manually trigger re-indexing of a document."""
+    """Manually trigger re-indexing of a document via Temporal workflow."""
     user = get_current_user(request)
     if not user:
         return JsonResponse({'error': 'Authentication required'}, status=401)
@@ -401,17 +454,202 @@ def document_index(request, document_id):
         return JsonResponse({'error': 'Document not found'}, status=404)
     
     try:
-        # Trigger indexing
-        index_document(document.id, user.id)
+        # Reset document status to QUEUED and send signal to queue
+        document.status = Document.Status.QUEUED
+        document.save(update_fields=['status'])
+        
+        # Get event loop for async operations
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Publish initial QUEUED status and send signal
+        async def publish_and_signal():
+            # Publish status update
+            try:
+                redis_client = await get_redis_client()
+                if redis_client:
+                    channel = f"documents:{user.id}"
+                    event = {
+                        "type": "status_update",
+                        "data": {
+                            "document_id": document.id,
+                            "status": "QUEUED",
+                        }
+                    }
+                    await redis_client.publish(channel, json.dumps(event).encode('utf-8'))
+            except Exception as e:
+                logger.debug(f"Failed to publish QUEUED status: {e}")
+            
+            # Send signal to add document to queue
+            await signal_add_document(document.id, user.id)
+        
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(lambda: asyncio.run(publish_and_signal()))
+                future.result(timeout=10)
+        else:
+            loop.run_until_complete(publish_and_signal())
+        
         document.refresh_from_db()
         
         return JsonResponse({
             'id': document.id,
             'status': document.status,
             'chunks_count': document.chunks_count,
-            'message': 'Indexing started'
+            'message': 'Re-indexing queued'
         })
     
     except Exception as e:
-        logger.error(f"Error indexing document {document_id}: {str(e)}")
-        return JsonResponse({'error': f'Indexing failed: {str(e)}'}, status=500)
+        logger.error(f"Error sending signal for re-indexing document {document_id}: {str(e)}", exc_info=True)
+        return JsonResponse({'error': f'Failed to start re-indexing: {str(e)}'}, status=500)
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+async def stream_document_status(request):
+    """
+    Stream document status updates using SSE (Server-Sent Events).
+    
+    Subscribes to Redis channel: documents:{user_id}
+    Receives real-time status updates as documents are processed.
+    
+    Returns:
+    SSE stream with events: status_update, heartbeat, error
+    """
+    user = await get_current_user_async(request)
+    if not user:
+        logger.warning("Unauthenticated request to stream_document_status endpoint")
+        return JsonResponse(
+            {'error': 'Authentication required'},
+            status=401
+        )
+    
+    def _format_sse_event(event: dict) -> str:
+        """Format event dict as SSE data line."""
+        event_json = json.dumps(event, default=str)
+        event_type = event.get("type", "message")
+        return f"event: {event_type}\ndata: {event_json}\n\n"
+    
+    async def event_stream():
+        """
+        Async generator for SSE events via Redis.
+        
+        Subscribes to channel: documents:{user_id}
+        Receives status updates for all user documents.
+        """
+        pubsub = None
+        channel = None
+        try:
+            # Try Redis streaming (if Temporal is configured)
+            use_redis = TEMPORAL_ADDRESS and TEMPORAL_TASK_QUEUE
+            
+            if use_redis:
+                try:
+                    # Get Redis client
+                    redis_client = await get_redis_client()
+                    channel = f"documents:{user.id}"
+                    
+                    # Create pubsub instance
+                    pubsub = redis_client.pubsub()
+                    await pubsub.subscribe(channel)
+                    
+                    # Wait for subscription confirmation
+                    confirm_msg = await pubsub.get_message(timeout=5.0)
+                    if confirm_msg and confirm_msg['type'] == 'subscribe':
+                        logger.info(f"Subscribed to Redis channel: {channel}")
+                    else:
+                        logger.warning(f"Unexpected subscription confirmation: {confirm_msg}")
+                    
+                    # Listen to Redis messages
+                    # No timeout - connection stays open until queue_complete or client disconnect
+                    loop = asyncio.get_running_loop()
+                    last_heartbeat_time = loop.time()
+                    heartbeat_interval = SSE_HEARTBEAT_SECONDS
+                    
+                    async for msg in pubsub.listen():
+                        current_time = loop.time()
+                        
+                        # Send heartbeat to keep connection alive
+                        if current_time - last_heartbeat_time >= heartbeat_interval:
+                            try:
+                                yield _format_sse_event({
+                                    "type": "heartbeat",
+                                    "data": {"timestamp": current_time}
+                                })
+                                last_heartbeat_time = current_time
+                            except Exception as e:
+                                logger.debug(f"Failed to send heartbeat: {e}")
+                        
+                        # Filter subscription confirmation messages
+                        if msg['type'] == 'subscribe' or msg['type'] == 'psubscribe':
+                            continue
+                        
+                        # Parse and forward message
+                        if msg['type'] == 'message':
+                            try:
+                                event_data = json.loads(msg['data'].decode('utf-8'))
+                                logger.info(f"[SSE] Received and forwarding event: type={event_data.get('type')} document_id={event_data.get('data', {}).get('document_id')}")
+                                yield _format_sse_event(event_data)
+                                
+                                # Close connection when queue is complete
+                                if event_data.get("type") == "queue_complete":
+                                    logger.info(f"Queue complete for user {user.id}, closing SSE connection")
+                                    break
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Failed to parse Redis message: {e}, raw_data={msg.get('data')}")
+                                continue
+                            except Exception as e:
+                                logger.error(f"Error processing Redis message: {e}", exc_info=True)
+                                continue
+                
+                except Exception as e:
+                    logger.error(f"Error in document status stream for user {user.id}: {e}", exc_info=True)
+                    yield _format_sse_event({
+                        "type": "error",
+                        "data": {"error": "Redis streaming unavailable", "retry": True}
+                    })
+                    return
+            else:
+                # Redis not available - send error
+                yield _format_sse_event({
+                    "type": "error",
+                    "data": {"error": "Real-time updates unavailable", "retry": False}
+                })
+                return
+                
+        except Exception as e:
+            logger.error(f"Error in document status stream for user {user.id}: {e}", exc_info=True)
+            yield _format_sse_event({
+                "type": "error",
+                "data": {"error": str(e)}
+            })
+        finally:
+            # Cleanup pubsub
+            if pubsub:
+                try:
+                    loop = asyncio.get_running_loop()
+                    if not loop.is_closed():
+                        try:
+                            await pubsub.unsubscribe()
+                            await pubsub.punsubscribe()
+                            await pubsub.close()
+                            logger.debug(f"Cleaned up Redis pubsub for channel {channel or 'unknown'}")
+                        except (RuntimeError, asyncio.CancelledError) as e:
+                            logger.debug(f"Event loop closing, skipping pubsub cleanup: {e}")
+                except Exception as e:
+                    logger.debug(f"Error cleaning up Redis pubsub (non-critical): {e}")
+    
+    # Create SSE response
+    response = StreamingHttpResponse(
+        event_stream(),
+        content_type='text/event-stream'
+    )
+    response['Cache-Control'] = 'no-cache'
+    response['X-Accel-Buffering'] = 'no'
+    response['Connection'] = 'keep-alive'
+    
+    return response

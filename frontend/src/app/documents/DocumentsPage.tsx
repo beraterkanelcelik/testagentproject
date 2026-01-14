@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { documentAPI, API_URL } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
@@ -7,7 +7,7 @@ import { getErrorMessage } from '@/lib/utils'
 interface Document {
   id: number
   title: string
-  status: 'UPLOADED' | 'EXTRACTED' | 'INDEXING' | 'READY' | 'FAILED'
+  status: 'UPLOADED' | 'QUEUED' | 'EXTRACTED' | 'INDEXING' | 'READY' | 'FAILED'
   chunks_count: number
   tokens_estimate: number
   size_bytes: number
@@ -20,7 +20,8 @@ interface Document {
 const StatusBadge = ({ status }: { status: Document['status'] }) => {
   const statusConfig = {
     UPLOADED: { label: 'Uploaded', className: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' },
-    EXTRACTED: { label: 'Extracted', className: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' },
+    QUEUED: { label: 'Queued', className: 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-200' },
+    EXTRACTED: { label: 'Extracting...', className: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' },
     INDEXING: { label: 'Indexing...', className: 'bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200' },
     READY: { label: 'Ready', className: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' },
     FAILED: { label: 'Failed', className: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200' },
@@ -121,6 +122,195 @@ export default function DocumentsPage() {
     loadDocuments()
   }, [])
 
+  // SSE connection for real-time document status updates
+  // Always establish connection when page loads to receive updates
+  useEffect(() => {
+    const token = localStorage.getItem('access_token')
+    if (!token) {
+      return // No auth token, skip SSE connection
+    }
+
+    let abortController: AbortController | null = null
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    let reconnectTimeout: NodeJS.Timeout | null = null
+
+    const connectSSE = async () => {
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:137',message:'SSE connection attempt started',data:{timestamp:Date.now()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+      // #endregion
+      try {
+        abortController = new AbortController()
+        const response = await fetch(`${API_URL}/api/documents/stream/`, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+          },
+          signal: abortController.signal,
+        })
+
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:148',message:'SSE fetch response received',data:{ok:response.ok,status:response.status,hasBody:!!response.body},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+        // #endregion
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`)
+        }
+
+        if (!response.body) {
+          throw new Error('Response body is null')
+        }
+
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:156',message:'SSE reader created, starting to read',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+        // #endregion
+
+        reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        while (true) {
+          const { done, value } = await reader.read()
+          
+          // #region agent log
+          fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:163',message:'SSE read chunk',data:{done,hasValue:!!value,valueLength:value?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+          // #endregion
+          
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n\n')
+          buffer = lines.pop() || ''
+
+          // #region agent log
+          fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:171',message:'SSE lines parsed',data:{linesCount:lines.length,bufferLength:buffer.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
+          // #endregion
+
+          for (const block of lines) {
+            // SSE format is: "event: {type}\ndata: {json}\n\n"
+            // Parse the block to extract the data line
+            const dataLine = block.split('\n').find(line => line.startsWith('data: '))
+            if (dataLine) {
+              // #region agent log
+              fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:177',message:'SSE data line found',data:{blockLength:block.length,dataLineLength:dataLine.length,dataLinePrefix:dataLine.substring(0,50)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+              // #endregion
+              try {
+                const data = JSON.parse(dataLine.slice(6))
+                
+                // #region agent log
+                fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:177',message:'SSE event parsed',data:{type:data.type,documentId:data.data?.document_id,status:data.data?.status},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+                // #endregion
+                
+                if (data.type === 'status_update') {
+                  const update = data.data
+                  const documentId = update.document_id
+                  const newStatus = update.status
+
+                  // #region agent log
+                  fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:182',message:'SSE status_update received, updating state',data:{documentId,newStatus},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+                  // #endregion
+
+                  // Update document in state
+                  setDocuments((prev) => {
+                    const currentDoc = prev.find((d) => d.id === documentId)
+                    
+                    // #region agent log
+                    fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:187',message:'SSE state update callback executing',data:{documentId,newStatus,foundDoc:!!currentDoc,prevDocsCount:prev.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
+                    // #endregion
+                    
+                    // Show toast when status changes to READY or FAILED
+                    if (currentDoc) {
+                      if (newStatus === 'READY' && currentDoc.status !== 'READY') {
+                        toast.success(`Document "${currentDoc.title}" indexed successfully`)
+                      } else if (newStatus === 'FAILED' && currentDoc.status !== 'FAILED') {
+                        toast.error(
+                          `Document "${currentDoc.title}" indexing failed: ${update.error_message || 'Unknown error'}`
+                        )
+                      }
+                    }
+
+                    // Update document with new status and optional fields
+                    return prev.map((d) => {
+                      if (d.id === documentId) {
+                        return {
+                          ...d,
+                          status: newStatus,
+                          chunks_count: update.chunks_count !== undefined ? update.chunks_count : d.chunks_count,
+                          tokens_estimate: update.tokens_estimate !== undefined ? update.tokens_estimate : d.tokens_estimate,
+                          error_message: update.error_message !== undefined ? update.error_message : d.error_message,
+                        }
+                      }
+                      return d
+                    })
+                  })
+                } else if (data.type === 'queue_complete') {
+                  // #region agent log
+                  fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:207',message:'SSE queue_complete received',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
+                  // #endregion
+                  // Note: With per-document workflows, queue_complete is no longer published from individual workflows
+                  // Keep connection open to receive updates from all document workflows
+                  // Connection will close when component unmounts or user navigates away
+                  console.debug('queue_complete event received (ignored - keeping connection open for all documents)')
+                } else if (data.type === 'heartbeat') {
+                  // Heartbeat received, connection is alive
+                  // No action needed
+                } else if (data.type === 'error') {
+                  console.error('SSE error:', data.data)
+                  if (data.data?.error && !data.data.retry) {
+                    // Non-retryable error, close connection
+                    return
+                  }
+                }
+              } catch (error) {
+                // #region agent log
+                fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:230',message:'SSE parse error',data:{error:String(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
+                // #endregion
+                console.error('Error parsing SSE message:', error)
+              }
+            }
+          }
+        }
+      } catch (error: any) {
+        // #region agent log
+        fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:236',message:'SSE connection error',data:{errorName:error.name,errorMessage:error.message},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
+        // #endregion
+        if (error.name === 'AbortError') {
+          // Connection was aborted (component unmounted), this is expected
+          return
+        }
+        console.error('SSE connection error:', error)
+        // Retry connection after 3 seconds
+        reconnectTimeout = setTimeout(() => {
+          connectSSE()
+        }, 3000)
+      } finally {
+        if (reader) {
+          try {
+            await reader.cancel()
+          } catch (e) {
+            // Ignore cancel errors
+          }
+        }
+      }
+    }
+
+    connectSSE()
+
+    // Cleanup on unmount
+    return () => {
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout)
+      }
+      if (abortController) {
+        abortController.abort()
+      }
+      if (reader) {
+        reader.cancel().catch(() => {
+          // Ignore cancel errors
+        })
+      }
+    }
+  }, []) // Only run once on mount - keep connection open to receive all updates
+
   const loadDocuments = async () => {
     setLoading(true)
     try {
@@ -176,8 +366,7 @@ export default function DocumentsPage() {
             )
           } else {
             toast.success(`File "${file.name}" uploaded successfully (indexing in progress)`)
-            // Poll for status updates if still indexing
-            pollDocumentStatus(uploadedDoc.id)
+            // Status will be updated automatically by the polling effect
           }
         } catch (error: unknown) {
           // Remove optimistic doc on error
@@ -201,45 +390,7 @@ export default function DocumentsPage() {
     }
   }
 
-  const pollDocumentStatus = async (documentId: number) => {
-    // Poll every 2 seconds for up to 30 seconds
-    let attempts = 0
-    const maxAttempts = 15
-
-    const poll = async () => {
-      if (attempts >= maxAttempts) return
-
-      try {
-        const response = await documentAPI.getDocument(documentId)
-        const doc = response.data
-
-        setDocuments((prev) =>
-          prev.map((d) => (d.id === documentId ? doc : d))
-        )
-
-        if (doc.status === 'READY' || doc.status === 'FAILED') {
-          // Stop polling when done
-          if (doc.status === 'READY') {
-            toast.success(`Document "${doc.title}" indexed successfully`)
-          } else {
-            toast.error(
-              `Document "${doc.title}" indexing failed: ${doc.error_message || 'Unknown error'}`
-            )
-          }
-          return
-        }
-
-        // Continue polling if still processing
-        attempts++
-        setTimeout(poll, 2000)
-      } catch (error) {
-        // Stop polling on error
-        console.error('Error polling document status:', error)
-      }
-    }
-
-    setTimeout(poll, 2000)
-  }
+  // Removed pollDocumentStatus - now handled by useEffect polling for all processing documents
 
   const handleDelete = (id: number, e: React.MouseEvent) => {
     e.stopPropagation()

@@ -10,6 +10,7 @@ if not hasattr(django, 'apps') or not django.apps.apps.ready:
     django.setup()
 
 from typing import Optional, Dict, Any
+from datetime import timedelta
 from temporalio.client import Client, WorkflowHandle
 from temporalio.common import WorkflowIDReusePolicy
 from app.core.temporal import get_temporal_client
@@ -157,6 +158,9 @@ async def get_or_create_workflow(
                 id=workflow_id,
                 task_queue=TEMPORAL_TASK_QUEUE,
                 id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                execution_timeout=timedelta(hours=24),  # Max 24 hours for chat session
+                memo={"user_id": str(user_id), "session_id": str(session_id)},
+                search_attributes={"UserID": [str(user_id)], "SessionID": [str(session_id)]},
                 start_signal="new_message",
                 start_signal_args=(message, plan_steps, flow, run_id, parent_message_id),
             )

@@ -92,8 +92,11 @@ class OpenAIEmbeddingsClient(EmbeddingsClientBase):
                     time.sleep(wait_time)
         
         # Persist token usage if user_id provided
+        # Note: This sync method may be called from async contexts
+        # We'll use sync version here - callers in async contexts should handle it
         if user_id and total_tokens > 0:
             from app.account.utils import increment_user_token_usage
+            # Use sync version - if called from async, wrap this call with sync_to_async
             increment_user_token_usage(user_id, total_tokens)
         
         return all_embeddings
@@ -117,6 +120,7 @@ class OpenAIEmbeddingsClient(EmbeddingsClientBase):
             estimated_tokens = len(text) // 4
             if estimated_tokens > 0:
                 from app.account.utils import increment_user_token_usage
+                # Use sync version - if called from async, wrap this call with sync_to_async
                 increment_user_token_usage(user_id, estimated_tokens)
         
         return embedding
