@@ -2,7 +2,7 @@
 Main workflow entrypoint for LangGraph Functional API.
 """
 import asyncio
-import atexit
+from functools import lru_cache
 from typing import Optional, List, Dict, Any, AsyncIterator, Union
 from langgraph.func import entrypoint
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -13,12 +13,11 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from app.agents.functional.models import AgentRequest, AgentResponse, ToolProposal
 from app.agents.functional.streaming import EventCallbackHandler
 from app.agents.functional.tasks import (
-    supervisor_task,
+    route_to_agent,
+    execute_agent,
+    refine_with_tool_results,
+    execute_tools,
     load_messages_task,
-    check_summarization_needed_task,
-    agent_task,
-    tool_execution_task,
-    agent_with_tool_results_task,
     save_message_task,
 )
 from app.agents.checkpoint import get_checkpoint_config
@@ -27,89 +26,97 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 
-# Global checkpointer instance (long-lived for Django app lifecycle)
-_checkpointer: Optional[PostgresSaver] = None
-_checkpointer_cm = None
-
-
-def get_checkpointer() -> Optional[PostgresSaver]:
+def build_db_url() -> str:
     """
-    Get checkpointer instance using LangGraph's built-in PostgresSaver.
+    Build database connection URL from Django settings.
     
-    According to LangGraph Functional API best practices:
-    - PostgresSaver.from_conn_string() returns a context manager
-    - For web frameworks (Django), we create a long-lived instance at startup
-    - The checkpointer is reused throughout the application lifecycle
-    - setup() is called once to initialize database tables
-    
-    Reference: https://docs.langchain.com/oss/python/langgraph/how-tos/persistence_postgres/
+    Returns:
+        PostgreSQL connection string
     """
-    global _checkpointer, _checkpointer_cm
+    from app.settings import DATABASES
+    
+    db_config = DATABASES['default']
+    return (
+        f"postgresql://{db_config['USER']}:{db_config['PASSWORD']}"
+        f"@{db_config['HOST']}:{db_config['PORT']}/{db_config['NAME']}"
+    )
 
-    if _checkpointer is not None:
-        return _checkpointer
 
+@lru_cache(maxsize=1)
+def get_sync_checkpointer() -> PostgresSaver:
+    """
+    Get cached sync checkpointer - connection pool managed by psycopg.
+
+    PostgresSaver.from_conn_string() creates a saver with an internal connection pool.
+    We use it as a context manager to properly manage the connection lifecycle.
+    @lru_cache ensures we keep the context manager open for the life of the process.
+
+    Returns:
+        PostgresSaver instance (context manager kept open by cache)
+    """
     try:
-        from app.settings import DATABASES
-
-        db_config = DATABASES['default']
-        db_url = (
-            f"postgresql://{db_config['USER']}:{db_config['PASSWORD']}"
-            f"@{db_config['HOST']}:{db_config['PORT']}/{db_config['NAME']}"
-        )
-
-        # PostgresSaver.from_conn_string() returns a context manager
-        # For Django, we create a long-lived instance by entering the context manager
-        # This is the recommended pattern for web frameworks per LangGraph docs
-        _checkpointer_cm = PostgresSaver.from_conn_string(db_url)
-        _checkpointer = _checkpointer_cm.__enter__()
+        db_url = build_db_url()
+        # Create checkpointer - use as context manager but keep it open
+        # The context manager manages connection lifecycle
+        checkpointer = PostgresSaver.from_conn_string(db_url)
 
         # Initialize database tables (required by LangGraph)
         # This is safe to call multiple times - it only creates tables if they don't exist
         try:
-            _checkpointer.setup()
+            checkpointer.setup()
             logger.info("Checkpointer tables initialized successfully")
         except Exception as e:
             # Tables may already exist, or there might be a connection issue
             logger.warning(f"Checkpointer setup warning (tables may already exist): {e}")
 
         logger.info("Checkpointer created successfully")
-        return _checkpointer
-
+        return checkpointer
     except Exception as e:
         logger.error(f"Failed to create checkpointer: {e}", exc_info=True)
-        return None
+        raise
 
 
-def cleanup_checkpointer():
+# For async workflows (if needed in the future)
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+_checkpointer_lock = asyncio.Lock()
+_async_checkpointer: Optional[AsyncPostgresSaver] = None
+
+
+async def get_async_checkpointer() -> AsyncPostgresSaver:
     """
-    Cleanup checkpointer on application shutdown.
+    Get or create async checkpointer with proper lifecycle.
     
-    Properly exits the context manager to close database connections.
-    This is registered with atexit to ensure cleanup on app shutdown.
+    Returns:
+        AsyncPostgresSaver instance
     """
-    global _checkpointer, _checkpointer_cm
-
-    if _checkpointer_cm is not None and _checkpointer is not None:
-        try:
-            # Properly exit the context manager to close connections
-            _checkpointer_cm.__exit__(None, None, None)
-            logger.info("Checkpointer cleaned up on shutdown")
-        except Exception as e:
-            logger.warning(f"Error cleaning up checkpointer: {e}")
-
-    _checkpointer = None
-    _checkpointer_cm = None
-
-
-# Register cleanup handler for application shutdown
-atexit.register(cleanup_checkpointer)
+    global _async_checkpointer
+    
+    if _async_checkpointer is None:
+        async with _checkpointer_lock:
+            if _async_checkpointer is None:
+                db_url = build_db_url()
+                # Create async checkpointer with connection pool
+                _async_checkpointer = AsyncPostgresSaver.from_conn_string(db_url)
+                await _async_checkpointer.setup()
+                logger.info("Async checkpointer created successfully")
+    
+    return _async_checkpointer
 
 
-# Create checkpointer instance for @entrypoint decorator
-# This is created at module import time for Django app lifecycle
-# According to LangGraph Functional API, checkpointer should be passed to @entrypoint
-_checkpointer_instance = get_checkpointer()
+# Backward compatibility alias
+def get_checkpointer() -> Optional[PostgresSaver]:
+    """
+    Get checkpointer instance (backward compatibility).
+    
+    Returns:
+        PostgresSaver instance or None on error
+    """
+    try:
+        return get_sync_checkpointer()
+    except Exception as e:
+        logger.error(f"Failed to get checkpointer: {e}", exc_info=True)
+        return None
 
 # Auto-executable tools per agent
 AUTO_EXECUTE_TOOLS = {
@@ -254,7 +261,7 @@ def is_auto_executable(tool_name: str, agent_name: str) -> bool:
     return tool_name in auto_tools
 
 
-@entrypoint(checkpointer=_checkpointer_instance)
+@entrypoint(checkpointer=get_sync_checkpointer())
 def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentResponse:
     """
     Main entrypoint for AI agent workflow using Functional API.
@@ -424,8 +431,7 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                 else:
                     query = request.query
                 
-                routing = supervisor_task(
-                    query=query,
+                routing = route_to_agent(
                     messages=messages,
                     config=checkpoint_config
                 ).result()
@@ -446,12 +452,10 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                 # and interrupt() will return the resume payload (approval decisions)
                 # Use generic agent task (no hardcoded routing)
                 logger.info(f"[WORKFLOW] Routing to {routing.agent} agent for query_preview={routing.query[:50] if routing.query else '(empty)'}...")
-                response = agent_task(
+                response = execute_agent(
                     agent_name=routing.agent,
-                    query=routing.query,
                     messages=messages,
                     user_id=current_user_id,
-                    tool_results=None,
                     model_name=None,
                     config=checkpoint_config
                 ).result()
@@ -621,11 +625,10 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                     # Fallback to agent_name from response
                     tool_exec_agent = response.agent_name if hasattr(response, 'agent_name') and response.agent_name else "greeter"
                 
-                tool_results = tool_execution_task(
+                tool_results = execute_tools(
                     tool_calls=tool_calls_to_execute,
-                    user_id=current_user_id,
                     agent_name=tool_exec_agent,
-                    chat_session_id=current_session_id,
+                    user_id=current_user_id,
                     config=checkpoint_config
                 ).result()
                 all_tool_results.extend(tool_results)
@@ -745,9 +748,8 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                     last_human_msg = next((msg for msg in reversed(messages) if isinstance(msg, HumanMessage)), None)
                     refine_query = last_human_msg.content if last_human_msg else ""
                 logger.info(f"[WORKFLOW] Invoking agent_with_tool_results_task for agent={refine_agent} with {len(tool_results)} tool results, messages_count={len(messages)}")
-                refined_response = agent_with_tool_results_task(
+                refined_response = refine_with_tool_results(
                     agent_name=refine_agent,
-                    query=refine_query,
                     messages=messages,
                     tool_results=tool_results,
                     user_id=current_user_id,
@@ -1097,11 +1099,10 @@ def _execute_plan_workflow(
                 
                 # Execute tool
                 tool_calls = [{"name": tool_name, "args": tool_args}]
-                tool_results = tool_execution_task(
+                tool_results = execute_tools(
                     tool_calls=tool_calls,
                     user_id=request.user_id,
                     agent_name=agent_name,
-                    chat_session_id=request.session_id,
                     config=checkpoint_config
                 ).result()
                 
@@ -1135,9 +1136,8 @@ def _execute_plan_workflow(
                     
                     # Post-process with agent
                     if tool_result.output is not None or tool_result.error:
-                        agent_response = agent_with_tool_results_task(
+                        agent_response = refine_with_tool_results(
                             agent_name=agent_name,
-                            query=step_query,
                             messages=messages,
                             tool_results=tool_results,
                             user_id=request.user_id,

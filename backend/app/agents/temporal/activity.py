@@ -4,14 +4,45 @@ Temporal activities for running LangGraph workflows and publishing to Redis.
 import json
 import os
 import asyncio
+import time
 from temporalio import activity
-from typing import Dict, Any
+from temporalio.exceptions import ApplicationError
+from pydantic import BaseModel, validator
+from typing import Dict, Any, Optional
 from app.agents.runner import AgentRunner
 from app.core.redis import get_redis_client
 from app.core.logging import get_logger
 from app.settings import REDIS_PUBLISH_CONCURRENCY
 
 logger = get_logger(__name__)
+
+
+class ChatActivityInput(BaseModel):
+    """Validated activity input."""
+    chat_id: int
+    state: Dict[str, Any]
+    
+    @validator('state')
+    def validate_state(cls, v):
+        """Validate state dictionary."""
+        # Ensure required fields
+        if 'user_id' not in v:
+            raise ValueError("state must contain user_id")
+        # Limit state size to prevent unbounded growth
+        state_size = len(json.dumps(v, default=str))
+        if state_size > 1_000_000:  # 1MB limit
+            raise ValueError(f"state too large: {state_size} bytes")
+        return v
+
+
+class ChatActivityOutput(BaseModel):
+    """Structured activity output."""
+    status: str  # "completed", "interrupted", "error"
+    message_id: Optional[int] = None
+    error: Optional[str] = None
+    interrupt_data: Optional[Dict] = None
+    event_count: int = 0
+    has_response: bool = False
 
 
 def _handle_publish_task_done(task: asyncio.Task, event_type: str, event_count: int, semaphore: asyncio.Semaphore) -> None:
@@ -91,58 +122,63 @@ async def _publish_event_async(
 @activity.defn
 async def run_chat_activity(input_data: Any) -> Dict[str, Any]:
     """
-    Activity that runs LangGraph workflow and publishes events to Redis.
-    
-    Implements Temporal best practices:
-    - Activity heartbeating for long-running operations
-    - Proper error handling and reporting
-    - Progress tracking via heartbeats
+    Activity with proper error handling and heartbeating.
     
     Args:
-        input_data: ChatActivityInput dataclass containing:
-            - chat_id: Chat session ID
-            - state: Workflow state containing:
-                - user_id: User ID
-                - session_id: Chat session ID
-                - message: User message
-                - plan_steps: Optional plan steps
-                - flow: Flow type (main, plan, etc.)
-                - tenant_id: Optional tenant ID for Redis channel
-            
-    Returns:
-        Dictionary with status and final state
-    """
-    # Extract values from input dataclass (Temporal may serialize it to dict)
-    if isinstance(input_data, dict):
-        chat_id = input_data.get("chat_id")
-        state = input_data.get("state", {})
-    else:
-        # It's a dataclass instance
-        chat_id = input_data.chat_id
-        state = input_data.state
-    
-    # Extract message and other parameters from state (common for both dict and dataclass paths)
-    message = state.get("message", "")
-    user_id = state.get("user_id")
-    session_id = state.get("session_id", chat_id)
-    
-    logger.info(f"[ACTIVITY_START] Starting activity for chat_id={chat_id}, message_preview={message[:50] if message else '(empty)'}..., user_id={user_id}, session_id={session_id}, state_keys={list(state.keys())}")
-    
-    if not message:
-        logger.error(f"[ACTIVITY_ERROR] No message in state for chat_id={chat_id}. State keys: {list(state.keys())}")
-        return {
-            "status": "error",
-            "error": "No message provided",
-            "event_count": 0
-        }
-    
-    # Redis client and channel - will be initialized only for stream mode
-    redis_client = None
-    channel = None
-    tenant_id = None
-    try:
+        input_data: ChatActivityInput (Pydantic model or dict)
         
-        # Send initial heartbeat to indicate activity has started
+    Returns:
+        ChatActivityOutput as dict
+    """
+    try:
+        # Validate input using Pydantic
+        if isinstance(input_data, dict):
+            validated_input = ChatActivityInput(**input_data)
+        elif isinstance(input_data, ChatActivityInput):
+            validated_input = input_data
+        else:
+            # Try to convert dataclass to dict then validate
+            if hasattr(input_data, '__dict__'):
+                validated_input = ChatActivityInput(**input_data.__dict__)
+            else:
+                raise ValueError(f"Invalid input_data type: {type(input_data)}")
+        
+        chat_id = validated_input.chat_id
+        state = validated_input.state
+        user_id = state["user_id"]
+        
+        # Extract message and other parameters
+        message = state.get("message", "")
+        session_id = state.get("session_id", chat_id)
+        
+        logger.info(f"[ACTIVITY_START] Starting activity for chat_id={chat_id}, message_preview={message[:50] if message else '(empty)'}..., user_id={user_id}, session_id={session_id}")
+        
+        if not message:
+            logger.error(f"[ACTIVITY_ERROR] No message in state for chat_id={chat_id}")
+            return ChatActivityOutput(
+                status="error",
+                error="No message provided",
+                event_count=0
+            ).dict()
+        
+        # Initialize Redis and Langfuse
+        redis_client = await get_redis_client()
+        tenant_id = state.get("tenant_id") or user_id
+        tenant_id = str(tenant_id)
+        channel = f"chat:{tenant_id}:{chat_id}"
+        
+        # Heartbeat tracking
+        last_heartbeat = time.time()
+        HEARTBEAT_INTERVAL = 10
+        
+        async def maybe_heartbeat():
+            nonlocal last_heartbeat
+            now = time.time()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                activity.heartbeat(f"Processing chat {chat_id}")
+                last_heartbeat = now
+        
+        # Send initial heartbeat
         activity.heartbeat({"status": "initialized", "chat_id": chat_id})
         
         # Create root Langfuse trace if enabled (for activity-level tracing)
@@ -208,22 +244,10 @@ async def run_chat_activity(input_data: Any) -> Dict[str, Any]:
         logger.info(f"[ACTIVITY] Executing in stream mode: session={chat_id}")
         
         # Initialize Redis and build channel for streaming
-        # HIGH-1: Make tenant_id required - remove dangerous "default" fallback
-        # Use user_id as tenant_id if tenant_id is missing to match SSE subscription
-        # SSE endpoint subscribes to chat:{user.id}:{chat_id}, so we must publish to the same channel
-        tenant_id = state.get("tenant_id") or state.get("user_id")
-        if not tenant_id:
-            logger.error(
-                f"[ACTIVITY_ERROR] Missing tenant_id in state for chat_id={chat_id}. "
-                f"State keys: {list(state.keys())}"
-            )
-            return {
-                "status": "error",
-                "error": "Missing tenant_id in workflow state"
-            }
+        tenant_id = state.get("tenant_id") or user_id
         tenant_id = str(tenant_id)  # Ensure it's a string
         channel = f"chat:{tenant_id}:{chat_id}"
-        logger.info(f"Starting chat activity for chat_id={chat_id}, channel={channel} (tenant_id={tenant_id}, user_id={state.get('user_id')})")
+        logger.info(f"Starting chat activity for chat_id={chat_id}, channel={channel} (tenant_id={tenant_id}, user_id={user_id})")
         
         # Get Redis client
         try:
@@ -232,37 +256,35 @@ async def run_chat_activity(input_data: Any) -> Dict[str, Any]:
             logger.error(f"Failed to get Redis client for stream mode chat_id={chat_id}: {e}", exc_info=True)
             redis_client = None
         
+        # Heartbeat tracking
+        last_heartbeat = time.time()
+        HEARTBEAT_INTERVAL = 10
+        
+        async def maybe_heartbeat():
+            nonlocal last_heartbeat
+            now = time.time()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                activity.heartbeat(f"Processing chat {chat_id}")
+                last_heartbeat = now
+        
         final_response = None
         event_count = [0]  # Use list for mutable closure
         interrupt_data = None  # Track interrupt data for resume
-        
-        # HIGH-3: Use time-based heartbeat instead of event-count-based
-        import time
-        last_heartbeat_time = time.time()
-        HEARTBEAT_INTERVAL = 10  # seconds
+        message_id = None
         
         # Semaphore for backpressure: cap concurrent publish operations
-        # Prevents unbounded in-flight tasks if publish rate > completion rate
-        # Create Redis publisher for streaming events
         publish_semaphore = asyncio.Semaphore(REDIS_PUBLISH_CONCURRENCY)
         
         # Run workflow using AgentRunner.stream()
         # Publish to Redis directly in the loop (non-blocking) to ensure tasks execute properly
         async for event in runner.stream():
-            event_type = event.get('type', 'unknown')
+            await maybe_heartbeat()
             
-            # Check for cancellation request from Temporal
-            # NOTE: Activity checks for cancellation from Temporal (workflow termination)
-            # Client disconnect does NOT trigger activity cancellation
-            # This ensures work completes even if user closes browser
-            # Applies to both stream and non-stream modes
+            # Check for cancellation
             if activity.is_cancelled():
-                logger.info(f"Activity cancelled for chat_id={chat_id}")
-                activity.heartbeat({"status": "cancelled", "chat_id": chat_id})
-                return {
-                    "status": "cancelled",
-                }
+                raise ApplicationError("Activity cancelled", non_retryable=True)
             
+            event_type = event.get('type', 'unknown')
             event_count[0] += 1
             
             # Publish event to Redis (fire-and-forget, non-blocking with backpressure)
@@ -293,35 +315,19 @@ async def run_chat_activity(input_data: Any) -> Dict[str, Any]:
                         pass
                     logger.error(f"[REDIS_PUBLISH] Failed to create publish task for {event_type} (event_count={current_count}): {e}", exc_info=True)
             
-            # HIGH-3: Time-based heartbeat (every 10 seconds or on important events)
-            current_time = time.time()
-            should_heartbeat = (
-                (current_time - last_heartbeat_time >= HEARTBEAT_INTERVAL) or
-                event.get("type") in ["final", "interrupt", "error"]
-            )
-            
-            if should_heartbeat:
-                activity.heartbeat({
-                    "status": "processing",
-                    "chat_id": chat_id,
-                    "event_count": event_count[0],
-                    "last_event_type": event.get("type"),
-                })
-                last_heartbeat_time = current_time
             
             # Check for interrupt (LangGraph native interrupt pattern)
             if event.get("type") == "interrupt":
                 interrupt_data = event.get("data") or event.get("interrupt")
                 logger.info(f"[HITL] [INTERRUPT] Workflow interrupted for chat_id={chat_id}, interrupt_data={interrupt_data}")
-                activity.heartbeat({"status": "interrupted", "chat_id": chat_id})
                 # Publish interrupt event to Redis for frontend
                 if redis_client:
                     asyncio.create_task(_publish_event_async(redis_client, channel, event, event_count[0]))
-                return {
-                    "status": "interrupted",
-                    "interrupt": interrupt_data,
-                    "run_id": state.get("run_id")  # Include for consistency
-                }
+                return ChatActivityOutput(
+                    status="interrupted",
+                    interrupt_data=interrupt_data,
+                    event_count=event_count[0]
+                ).dict()
             
             # Capture final response (for message_saved event)
             if event.get("type") == "final":
@@ -383,29 +389,38 @@ async def run_chat_activity(input_data: Any) -> Dict[str, Any]:
         activity.heartbeat({"status": "completed", "chat_id": chat_id, "event_count": event_count[0]})
         logger.info(f"Chat activity completed for chat_id={chat_id}")
         
-        # Return minimal payload - streaming events go via Redis, workflow already has state
-        return {
-            "status": "completed",
-            "has_response": bool(final_response),
-        }
-    except Exception as e:
-        logger.error(f"Error in chat activity for chat_id={chat_id}: {e}", exc_info=True)
-        
-        # End Langfuse trace on error if created
-        if 'langfuse_trace' in locals() and langfuse_trace:
+        # Get saved message ID if available
+        if final_response and session_id:
             try:
-                langfuse_trace.end()
-            except Exception:
-                pass  # Ignore trace ending errors during error handling
+                from app.db.models.message import Message
+                from asgiref.sync import sync_to_async
+                
+                latest_msg = await sync_to_async(
+                    Message.objects.filter(
+                        session_id=session_id,
+                        role='assistant'
+                    ).order_by('-created_at').first
+                )()
+                if latest_msg:
+                    message_id = latest_msg.id
+            except Exception as e:
+                logger.warning(f"Failed to get message ID: {e}")
         
-        # Send heartbeat on error
-        try:
-            activity.heartbeat({"status": "error", "chat_id": chat_id, "error": str(e)})
-        except Exception:
-            pass  # Ignore heartbeat errors during error handling
+        # Return structured output
+        return ChatActivityOutput(
+            status="completed",
+            message_id=message_id,
+            event_count=event_count[0],
+            has_response=bool(final_response)
+        ).dict()
         
-        # Return minimal error payload
-        return {
-            "status": "error",
-            "error": str(e),
-        }
+    except ApplicationError:
+        raise  # Don't wrap ApplicationError
+    except Exception as e:
+        logger.exception(f"Activity error for chat {validated_input.chat_id if 'validated_input' in locals() else 'unknown'}")
+        # Wrap in ApplicationError for proper handling
+        raise ApplicationError(
+            str(e),
+            type="CHAT_ACTIVITY_ERROR",
+            non_retryable=False  # Allow retry for transient errors
+        )

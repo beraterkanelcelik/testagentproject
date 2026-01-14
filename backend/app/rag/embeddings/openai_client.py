@@ -1,8 +1,9 @@
 """
-OpenAI embedding client implementation.
+OpenAI embedding client implementation with async support.
 """
 import os
 import time
+import asyncio
 from typing import List
 from django.conf import settings
 from langchain_openai import OpenAIEmbeddings
@@ -37,6 +38,9 @@ class OpenAIEmbeddingsClient(EmbeddingsClientBase):
         
         # OpenAI batch limits
         self._max_batch_size = 2048  # OpenAI allows up to 2048 texts per request
+        
+        # Semaphore for async rate limiting
+        self._semaphore = asyncio.Semaphore(5)  # Max 5 concurrent requests
     
     @property
     def model_name(self) -> str:
@@ -122,5 +126,79 @@ class OpenAIEmbeddingsClient(EmbeddingsClientBase):
                 from app.account.utils import increment_user_token_usage
                 # Use sync version - if called from async, wrap this call with sync_to_async
                 increment_user_token_usage(user_id, estimated_tokens)
+        
+        return embedding
+    
+    async def aembed_texts(
+        self, 
+        texts: List[str], 
+        user_id: int = None
+    ) -> List[List[float]]:
+        """
+        Embed texts with parallel batching using asyncio.gather.
+        
+        Args:
+            texts: List of texts to embed
+            user_id: Optional user ID for token usage tracking
+            
+        Returns:
+            List of embedding vectors
+        """
+        if not texts:
+            return []
+        
+        # Split into batches
+        batches = [
+            texts[i:i + self._max_batch_size]
+            for i in range(0, len(texts), self._max_batch_size)
+        ]
+        
+        async def embed_batch(batch: List[str]) -> List[List[float]]:
+            """Embed a single batch with semaphore-based rate limiting."""
+            async with self._semaphore:
+                # Use LangChain's async method
+                return await self._embeddings.aembed_documents(batch)
+        
+        # Execute batches in parallel
+        results = await asyncio.gather(*[
+            embed_batch(batch) for batch in batches
+        ])
+        
+        # Flatten results
+        all_embeddings = []
+        for batch_embeddings in results:
+            all_embeddings.extend(batch_embeddings)
+        
+        # Track token usage
+        if user_id:
+            total_tokens = sum(len(text) // 4 for text in texts)
+            if total_tokens > 0:
+                from app.account.utils import increment_user_token_usage
+                from asgiref.sync import sync_to_async
+                await sync_to_async(increment_user_token_usage)(user_id, total_tokens)
+        
+        return all_embeddings
+    
+    async def aembed_query(self, text: str, user_id: int = None) -> List[float]:
+        """
+        Embed single query asynchronously.
+        
+        Args:
+            text: Query text to embed
+            user_id: Optional user ID for token usage tracking
+            
+        Returns:
+            Embedding vector
+        """
+        async with self._semaphore:
+            embedding = await self._embeddings.aembed_query(text)
+        
+        # Track token usage
+        if user_id:
+            estimated_tokens = len(text) // 4
+            if estimated_tokens > 0:
+                from app.account.utils import increment_user_token_usage
+                from asgiref.sync import sync_to_async
+                await sync_to_async(increment_user_token_usage)(user_id, estimated_tokens)
         
         return embedding

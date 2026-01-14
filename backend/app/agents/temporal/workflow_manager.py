@@ -160,7 +160,8 @@ async def get_or_create_workflow(
                 id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
                 execution_timeout=timedelta(hours=24),  # Max 24 hours for chat session
                 memo={"user_id": str(user_id), "session_id": str(session_id)},
-                search_attributes={"UserID": [str(user_id)], "SessionID": [str(session_id)]},
+                # Note: search_attributes removed - would require Temporal namespace configuration
+                # Use memo instead for workflow metadata
                 start_signal="new_message",
                 start_signal_args=(message, plan_steps, flow, run_id, parent_message_id),
             )

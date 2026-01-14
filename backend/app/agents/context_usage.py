@@ -1,11 +1,12 @@
 """
-Token context usage tracking for frontend display.
+Token context usage tracking and message trimming for frontend display.
 
 Provides utilities to calculate and track token usage as a percentage
-of the model's context window, similar to coding agents.
+of the model's context window, and trim messages using LangChain's built-in utilities.
 """
-from typing import Dict, Any, List
-from langchain_core.messages import BaseMessage
+from typing import Dict, Any, List, Optional
+from langchain_core.messages import BaseMessage, trim_messages, SystemMessage
+from langchain_openai import ChatOpenAI
 from app.agents.config import get_model_context_window, OPENAI_MODEL
 from app.rag.chunking.tokenizer import count_tokens
 from app.core.logging import get_logger
@@ -97,3 +98,60 @@ def should_trigger_summarization(
         )
 
     return should_summarize
+
+
+def get_trimmed_messages(
+    messages: List[BaseMessage],
+    model_name: str = None,
+    max_tokens: int = None,
+    include_system: bool = True,
+    strategy: str = "last"
+) -> List[BaseMessage]:
+    """
+    Trim messages to fit within context window using LangChain's trim_messages utility.
+    
+    Args:
+        messages: List of conversation messages
+        model_name: Model name (defaults to OPENAI_MODEL)
+        max_tokens: Maximum tokens to keep (defaults to 80% of model context window)
+        include_system: Whether to include system messages
+        strategy: Trimming strategy ("last" keeps most recent, "first" keeps oldest)
+        
+    Returns:
+        Trimmed list of messages that fit within the context window
+    """
+    model_name = model_name or OPENAI_MODEL
+    
+    try:
+        # Get model's context window size
+        context_window = get_model_context_window(model_name)
+        
+        # Default to 80% of context window if max_tokens not specified
+        if max_tokens is None:
+            max_tokens = int(context_window * 0.8)
+        
+        # Create token counter using the model's tokenizer
+        llm = ChatOpenAI(model=model_name)
+        
+        # Use LangChain's trim_messages utility
+        trimmed = trim_messages(
+            messages,
+            max_tokens=max_tokens,
+            token_counter=llm,  # Uses model's tokenizer
+            strategy=strategy,  # "last" keeps most recent messages
+            include_system=include_system,
+            allow_partial=False,
+            start_on="human"  # Ensure we start with a human message
+        )
+        
+        logger.info(
+            f"Trimmed messages: {len(messages)} -> {len(trimmed)} messages "
+            f"(max_tokens={max_tokens}, strategy={strategy})"
+        )
+        
+        return trimmed
+        
+    except Exception as e:
+        logger.error(f"Error trimming messages: {e}", exc_info=True)
+        # Return original messages on error
+        return messages

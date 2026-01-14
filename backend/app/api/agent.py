@@ -8,10 +8,12 @@ import asyncio
 from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
+from pydantic import ValidationError
 from app.core.dependencies import get_current_user, get_current_user_async
 from app.core.logging import get_logger
 from app.core.redis import get_redis_client
 from app.agents.temporal.workflow_manager import get_or_create_workflow
+from app.api.schemas import StreamAgentRequest, RunAgentRequest
 from app.settings import (
     TEMPORAL_ADDRESS, TEMPORAL_TASK_QUEUE,
     STREAM_TIMEOUT_SECONDS, SSE_HEARTBEAT_SECONDS,
@@ -61,14 +63,28 @@ async def stream_agent(request):
     cache.set(stream_count_key, current_count + 1, timeout=600)  # 10 min TTL
     
     try:
-        data = json.loads(request.body)
-        chat_session_id = data.get('chat_session_id')
-        message = data.get('message', '').strip()
-        plan_steps = data.get('plan_steps')
-        flow = data.get('flow', 'main')
+        # Validate request using Pydantic
+        try:
+            data = json.loads(request.body)
+            validated_request = StreamAgentRequest(**data)
+        except ValidationError as e:
+            logger.warning(f"Invalid request data: {e}")
+            return JsonResponse(
+                {'error': 'Invalid request data', 'details': e.errors()},
+                status=400
+            )
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON in request: {e}")
+            return JsonResponse(
+                {'error': 'Invalid JSON'},
+                status=400
+            )
         
-        # CRITICAL-4: Generate or use provided idempotency key
-        idempotency_key = data.get('idempotency_key') or str(uuid.uuid4())
+        chat_session_id = validated_request.chat_session_id
+        message = validated_request.message
+        plan_steps = validated_request.plan_steps
+        flow = validated_request.flow
+        idempotency_key = validated_request.idempotency_key or str(uuid.uuid4())
         
         # Check for duplicate request using Redis
         try:
@@ -88,13 +104,6 @@ async def stream_agent(request):
         except Exception as redis_error:
             # If Redis is unavailable, log warning but continue (non-blocking)
             logger.warning(f"Failed to check idempotency key in Redis: {redis_error}")
-        
-        if not chat_session_id:
-            logger.warning(f"Missing chat_session_id in stream_agent request from user {user.id}")
-            return JsonResponse(
-                {'error': 'chat_session_id is required'},
-                status=400
-            )
         
         # For plan execution, message can be empty
         if flow != 'plan' and not message:
