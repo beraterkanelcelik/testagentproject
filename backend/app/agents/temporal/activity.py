@@ -10,7 +10,7 @@ from temporalio.exceptions import ApplicationError
 from pydantic import BaseModel, validator
 from typing import Dict, Any, Optional
 from app.agents.runner import AgentRunner
-from app.core.redis import get_redis_client
+from app.core.redis import get_redis_client, RobustRedisPublisher, get_message_buffer
 from app.core.logging import get_logger
 from app.settings import REDIS_PUBLISH_CONCURRENCY
 
@@ -92,29 +92,40 @@ async def _serialize_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _publish_event_async(
-    redis_client,
+    publisher: RobustRedisPublisher,
     channel: str,
     event: Dict[str, Any],
-    event_count: int
+    event_count: int,
+    message_buffer = None
 ) -> None:
     """
-    Background task for non-blocking Redis publish.
-    
+    Background task for non-blocking Redis publish using RobustRedisPublisher.
+
     Args:
-        redis_client: Redis client instance
+        publisher: RobustRedisPublisher instance
         channel: Redis channel name
         event: Event dictionary to publish
         event_count: Event count for logging
+        message_buffer: Optional MessageBuffer for storing events
     """
     try:
         serializable_event = await _serialize_event(event)
-        event_json = json.dumps(serializable_event, default=str)
-        await redis_client.publish(channel, event_json.encode('utf-8'))
-        
-        event_type = event.get('type', 'unknown')
-        # Only log non-token events for debugging (token events are too verbose)
-        if event_type != "token":
-            logger.debug(f"[REDIS_PUBLISH] Published event type={event_type} to {channel} (event_count={event_count})")
+
+        # Publish using robust publisher with retry logic
+        success = await publisher.publish(channel, serializable_event)
+
+        if success:
+            # Add to message buffer for catch-up support
+            if message_buffer:
+                await message_buffer.add(channel, serializable_event)
+
+            event_type = event.get('type', 'unknown')
+            # Only log non-token events for debugging (token events are too verbose)
+            if event_type != "token":
+                logger.debug(f"[REDIS_PUBLISH] Published event type={event_type} to {channel} (event_count={event_count})")
+        else:
+            event_type = event.get('type', 'unknown')
+            logger.warning(f"[REDIS_PUBLISH] Failed to publish event type={event_type} to {channel} (event_count={event_count})")
     except Exception as e:
         logger.error(f"[REDIS_PUBLISH] Error in background publish: {e}", exc_info=True)
 
@@ -249,12 +260,16 @@ async def run_chat_activity(input_data: Any) -> Dict[str, Any]:
         channel = f"chat:{tenant_id}:{chat_id}"
         logger.info(f"Starting chat activity for chat_id={chat_id}, channel={channel} (tenant_id={tenant_id}, user_id={user_id})")
         
-        # Get Redis client
+        # Get Redis client and create robust publisher
         try:
             redis_client = await get_redis_client()
+            publisher = RobustRedisPublisher(redis_client)
+            message_buffer = await get_message_buffer()
         except Exception as e:
             logger.error(f"Failed to get Redis client for stream mode chat_id={chat_id}: {e}", exc_info=True)
             redis_client = None
+            publisher = None
+            message_buffer = None
         
         # Heartbeat tracking
         last_heartbeat = time.time()
@@ -288,21 +303,21 @@ async def run_chat_activity(input_data: Any) -> Dict[str, Any]:
             event_count[0] += 1
             
             # Publish event to Redis (fire-and-forget, non-blocking with backpressure)
-            if redis_client:
+            if publisher:
                 # DESIGN NOTE: Backpressure strategy
                 # Current approach: semaphore throttles ALL events (including tokens)
                 # - When Redis is slow, this slows down token consumption, which can slow upstream LLM streaming
                 # - This protects the system from unbounded memory growth (current priority)
-                # Alternative approach (for "best-effort tokens"): 
+                # Alternative approach (for "best-effort tokens"):
                 # - Drop token events when semaphore saturated, but always publish interrupt/final/error
                 # - This keeps LLM streaming fast but may drop some tokens under load
                 # Current choice: throttle all events to protect system stability
-                
+
                 # Acquire semaphore before creating task (prevents unbounded in-flight tasks)
                 current_count = event_count[0]
                 try:
                     await publish_semaphore.acquire()
-                    task = asyncio.create_task(_publish_event_async(redis_client, channel, event, current_count))
+                    task = asyncio.create_task(_publish_event_async(publisher, channel, event, current_count, message_buffer))
                     # Add done callback to release semaphore and log errors
                     # Semaphore is released in callback, not here, to ensure it's always released
                     task.add_done_callback(lambda t, et=event_type, ec=current_count, sem=publish_semaphore: _handle_publish_task_done(t, et, ec, sem))
@@ -321,8 +336,8 @@ async def run_chat_activity(input_data: Any) -> Dict[str, Any]:
                 interrupt_data = event.get("data") or event.get("interrupt")
                 logger.info(f"[HITL] [INTERRUPT] Workflow interrupted for chat_id={chat_id}, interrupt_data={interrupt_data}")
                 # Publish interrupt event to Redis for frontend
-                if redis_client:
-                    asyncio.create_task(_publish_event_async(redis_client, channel, event, event_count[0]))
+                if publisher:
+                    asyncio.create_task(_publish_event_async(publisher, channel, event, event_count[0], message_buffer))
                 return ChatActivityOutput(
                     status="interrupted",
                     interrupt_data=interrupt_data,
@@ -359,7 +374,7 @@ async def run_chat_activity(input_data: Any) -> Dict[str, Any]:
                         }
                     }
                     # Use fire-and-forget for message_saved event too
-                    asyncio.create_task(_publish_event_async(redis_client, channel, message_saved_event, event_count[0] + 1))
+                    asyncio.create_task(_publish_event_async(publisher, channel, message_saved_event, event_count[0] + 1, message_buffer))
                     logger.info(f"[MESSAGE_SAVED_EVENT] Emitted assistant message_saved event db_id={latest_assistant_message.id} session={chat_id}")
                 else:
                     logger.warning(f"[MESSAGE_SAVED_EVENT] No assistant message found for session={chat_id} after final event")

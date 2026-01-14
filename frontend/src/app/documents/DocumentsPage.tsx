@@ -135,9 +135,6 @@ export default function DocumentsPage() {
     let reconnectTimeout: NodeJS.Timeout | null = null
 
     const connectSSE = async () => {
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:137',message:'SSE connection attempt started',data:{timestamp:Date.now()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-      // #endregion
       try {
         abortController = new AbortController()
         const response = await fetch(`${API_URL}/api/documents/stream/`, {
@@ -148,10 +145,6 @@ export default function DocumentsPage() {
           signal: abortController.signal,
         })
 
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:148',message:'SSE fetch response received',data:{ok:response.ok,status:response.status,hasBody:!!response.body},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-        // #endregion
-
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`)
         }
@@ -160,10 +153,6 @@ export default function DocumentsPage() {
           throw new Error('Response body is null')
         }
 
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:156',message:'SSE reader created, starting to read',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-        // #endregion
-
         reader = response.body.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
@@ -171,51 +160,28 @@ export default function DocumentsPage() {
         while (true) {
           const { done, value } = await reader.read()
           
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:163',message:'SSE read chunk',data:{done,hasValue:!!value,valueLength:value?.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-          // #endregion
-          
           if (done) break
 
           buffer += decoder.decode(value, { stream: true })
           const lines = buffer.split('\n\n')
           buffer = lines.pop() || ''
 
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:171',message:'SSE lines parsed',data:{linesCount:lines.length,bufferLength:buffer.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'})}).catch(()=>{});
-          // #endregion
-
           for (const block of lines) {
             // SSE format is: "event: {type}\ndata: {json}\n\n"
             // Parse the block to extract the data line
             const dataLine = block.split('\n').find(line => line.startsWith('data: '))
             if (dataLine) {
-              // #region agent log
-              fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:177',message:'SSE data line found',data:{blockLength:block.length,dataLineLength:dataLine.length,dataLinePrefix:dataLine.substring(0,50)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-              // #endregion
               try {
                 const data = JSON.parse(dataLine.slice(6))
-                
-                // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:177',message:'SSE event parsed',data:{type:data.type,documentId:data.data?.document_id,status:data.data?.status},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-                // #endregion
                 
                 if (data.type === 'status_update') {
                   const update = data.data
                   const documentId = update.document_id
                   const newStatus = update.status
 
-                  // #region agent log
-                  fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:182',message:'SSE status_update received, updating state',data:{documentId,newStatus},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-                  // #endregion
-
                   // Update document in state
                   setDocuments((prev) => {
                     const currentDoc = prev.find((d) => d.id === documentId)
-                    
-                    // #region agent log
-                    fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:187',message:'SSE state update callback executing',data:{documentId,newStatus,foundDoc:!!currentDoc,prevDocsCount:prev.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'})}).catch(()=>{});
-                    // #endregion
                     
                     // Show toast when status changes to READY or FAILED
                     if (currentDoc) {
@@ -243,9 +209,6 @@ export default function DocumentsPage() {
                     })
                   })
                 } else if (data.type === 'queue_complete') {
-                  // #region agent log
-                  fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:207',message:'SSE queue_complete received',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'})}).catch(()=>{});
-                  // #endregion
                   // Note: With per-document workflows, queue_complete is no longer published from individual workflows
                   // Keep connection open to receive updates from all document workflows
                   // Connection will close when component unmounts or user navigates away
@@ -261,18 +224,12 @@ export default function DocumentsPage() {
                   }
                 }
               } catch (error) {
-                // #region agent log
-                fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:230',message:'SSE parse error',data:{error:String(error)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'})}).catch(()=>{});
-                // #endregion
                 console.error('Error parsing SSE message:', error)
               }
             }
           }
         }
       } catch (error: any) {
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/ad34a41a-311a-49f2-99f9-1e391f661a8a',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentsPage.tsx:236',message:'SSE connection error',data:{errorName:error.name,errorMessage:error.message},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'})}).catch(()=>{});
-        // #endregion
         if (error.name === 'AbortError') {
           // Connection was aborted (component unmounted), this is expected
           return

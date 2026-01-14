@@ -87,7 +87,9 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - VITE_API_URL=http://localhost:8000
+      # VITE_API_URL is optional - if not set, frontend will use same hostname as browser with port 8000
+      # This allows dynamic API URL detection for Twingate/remote access
+      - VITE_API_URL=${VITE_API_URL:-}
       # Node.js memory limit (lowered to 512MB to reduce pressure during startup)
       - NODE_OPTIONS=--max-old-space-size=512
     volumes:

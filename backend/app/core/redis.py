@@ -9,6 +9,7 @@ import json
 import time
 from urllib.parse import urlparse, urlunparse
 from typing import Optional, Dict, Any, List
+from collections import deque
 
 import redis.asyncio as redis
 from app.settings import REDIS_URL, REDIS_PASSWORD
@@ -151,13 +152,337 @@ async def close_redis_client(loop_id: Optional[int] = None) -> None:
     await close_redis_for_current_loop()
 
 
+class RobustRedisPubSub:
+    """Wrapper for Redis Pub/Sub with health checks and auto-recovery."""
+
+    def __init__(self, redis_client: redis.Redis, channel: str):
+        """
+        Initialize robust Redis Pub/Sub client.
+
+        Args:
+            redis_client: Redis async client
+            channel: Channel to subscribe to
+        """
+        self.redis_client = redis_client
+        self.channel = channel
+        self.pubsub: Optional[redis.client.PubSub] = None
+        self._last_message_time: float = 0
+        self._health_check_interval: float = 30.0
+        self._connected: bool = False
+
+    async def connect(self) -> bool:
+        """Connect and subscribe to channel with health check."""
+        try:
+            self.pubsub = self.redis_client.pubsub()
+            await self.pubsub.subscribe(self.channel)
+
+            # Wait for subscription confirmation
+            confirm_msg = await asyncio.wait_for(
+                self.pubsub.get_message(ignore_subscribe_messages=False),
+                timeout=5.0
+            )
+            if confirm_msg and confirm_msg['type'] == 'subscribe':
+                self._connected = True
+                self._last_message_time = time.time()
+                logger.info(f"Connected to channel: {self.channel}")
+                return True
+
+            logger.error(f"Failed to subscribe to {self.channel}")
+            return False
+        except Exception as e:
+            logger.error(f"Connection error: {e}", exc_info=True)
+            return False
+
+    async def is_healthy(self) -> bool:
+        """Check if connection is healthy."""
+        if not self._connected or not self.pubsub:
+            return False
+
+        try:
+            # Check if connection is alive via PING
+            await self.redis_client.ping()
+
+            # Check if we've received messages recently
+            time_since_last_msg = time.time() - self._last_message_time
+            if time_since_last_msg > self._health_check_interval:
+                # Send a heartbeat message and expect to receive it
+                test_msg = {"type": "ping", "timestamp": time.time()}
+                await self.redis_client.publish(self.channel, json.dumps(test_msg))
+
+            return True
+        except Exception as e:
+            logger.warning(f"Health check failed: {e}")
+            return False
+
+    async def listen(self):
+        """
+        Listen for messages with automatic reconnection.
+
+        Yields:
+            Dict with message data
+        """
+        reconnect_backoff = [1, 2, 5, 10, 30]  # seconds
+        reconnect_attempt = 0
+
+        while True:
+            # Ensure we're connected
+            if not self._connected:
+                if reconnect_attempt < len(reconnect_backoff):
+                    wait_time = reconnect_backoff[reconnect_attempt]
+                    logger.info(f"Reconnecting in {wait_time}s (attempt {reconnect_attempt + 1})")
+                    await asyncio.sleep(wait_time)
+                    reconnect_attempt += 1
+                else:
+                    logger.error(f"Max reconnection attempts reached for {self.channel}")
+                    raise ConnectionError(f"Failed to reconnect to {self.channel}")
+
+                # Try to reconnect
+                if not await self.connect():
+                    continue
+
+                # Reset backoff on successful reconnection
+                reconnect_attempt = 0
+
+            # Check health periodically
+            if not await self.is_healthy():
+                logger.warning(f"Connection unhealthy, reconnecting...")
+                self._connected = False
+                await self.disconnect()
+                continue
+
+            # Listen for messages
+            try:
+                message = await asyncio.wait_for(
+                    self.pubsub.get_message(ignore_subscribe_messages=True),
+                    timeout=5.0
+                )
+
+                if message and message['type'] == 'message':
+                    self._last_message_time = time.time()
+                    data = json.loads(message['data'].decode('utf-8'))
+
+                    # Skip internal ping messages
+                    if data.get('type') != 'ping':
+                        yield data
+
+            except asyncio.TimeoutError:
+                # No message, continue (used for health checks)
+                continue
+            except Exception as e:
+                logger.error(f"Error receiving message: {e}", exc_info=True)
+                self._connected = False
+                await self.disconnect()
+
+    async def disconnect(self):
+        """Gracefully disconnect from channel."""
+        if self.pubsub:
+            try:
+                await self.pubsub.unsubscribe(self.channel)
+                await self.pubsub.close()
+            except Exception as e:
+                logger.debug(f"Error during disconnect: {e}")
+            finally:
+                self.pubsub = None
+                self._connected = False
+
+
+class RobustRedisPublisher:
+    """Redis publisher with retry logic and circuit breaker."""
+
+    def __init__(self, redis_client: redis.Redis):
+        """
+        Initialize robust Redis publisher.
+
+        Args:
+            redis_client: Redis async client
+        """
+        self.redis_client = redis_client
+        self._circuit_breaker_failures = 0
+        self._circuit_breaker_threshold = 5
+        self._circuit_breaker_reset_time = 60.0
+        self._last_failure_time = 0
+
+    async def publish(
+        self,
+        channel: str,
+        message: dict,
+        max_retries: int = 3,
+        retry_backoff: float = 1.0
+    ) -> bool:
+        """
+        Publish message with retry logic.
+
+        Args:
+            channel: Redis channel
+            message: Message dict to publish
+            max_retries: Maximum retry attempts
+            retry_backoff: Initial backoff in seconds (exponential)
+
+        Returns:
+            True if published successfully, False otherwise
+        """
+        # Check circuit breaker
+        if self._is_circuit_open():
+            logger.warning(f"Circuit breaker open for Redis publish, dropping message")
+            return False
+
+        # Serialize message
+        try:
+            serialized = json.dumps(message, default=str)
+        except Exception as e:
+            logger.error(f"Failed to serialize message: {e}")
+            return False
+
+        # Try to publish with retries
+        for attempt in range(max_retries):
+            try:
+                # Publish message
+                num_subscribers = await self.redis_client.publish(channel, serialized)
+
+                # Reset circuit breaker on success
+                self._circuit_breaker_failures = 0
+
+                # Log warning if no subscribers (not an error, but worth noting)
+                if num_subscribers == 0:
+                    logger.debug(f"Published to {channel} but no subscribers")
+                else:
+                    logger.debug(f"Published to {channel} ({num_subscribers} subscribers)")
+
+                return True
+
+            except (redis.ConnectionError, redis.TimeoutError) as e:
+                logger.warning(f"Redis connection error on publish (attempt {attempt + 1}/{max_retries}): {e}")
+
+                # Increment circuit breaker
+                self._circuit_breaker_failures += 1
+                self._last_failure_time = time.time()
+
+                if attempt < max_retries - 1:
+                    # Exponential backoff
+                    wait_time = retry_backoff * (2 ** attempt)
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"Failed to publish after {max_retries} attempts")
+                    return False
+
+            except Exception as e:
+                logger.error(f"Unexpected error publishing message: {e}", exc_info=True)
+                return False
+
+        return False
+
+    def _is_circuit_open(self) -> bool:
+        """Check if circuit breaker is open."""
+        if self._circuit_breaker_failures >= self._circuit_breaker_threshold:
+            # Check if we should reset
+            time_since_failure = time.time() - self._last_failure_time
+            if time_since_failure > self._circuit_breaker_reset_time:
+                logger.info("Resetting circuit breaker")
+                self._circuit_breaker_failures = 0
+                return False
+            return True
+        return False
+
+
+class MessageBuffer:
+    """In-memory buffer for recent messages per channel."""
+
+    def __init__(self, max_messages: int = 100, ttl_seconds: int = 300):
+        """
+        Initialize message buffer.
+
+        Args:
+            max_messages: Maximum messages to keep per channel
+            ttl_seconds: Time-to-live for messages in seconds
+        """
+        self._buffers: Dict[str, deque] = {}
+        self._max_messages = max_messages
+        self._ttl_seconds = ttl_seconds
+        self._lock = asyncio.Lock()
+
+    async def add(self, channel: str, message: dict):
+        """Add message to buffer."""
+        async with self._lock:
+            if channel not in self._buffers:
+                self._buffers[channel] = deque(maxlen=self._max_messages)
+
+            # Add timestamp if not present
+            if 'timestamp' not in message:
+                message['timestamp'] = time.time()
+
+            self._buffers[channel].append(message)
+
+    async def get_recent(
+        self,
+        channel: str,
+        since_timestamp: Optional[float] = None,
+        max_count: int = 50
+    ) -> List[dict]:
+        """
+        Get recent messages from buffer.
+
+        Args:
+            channel: Channel name
+            since_timestamp: Only return messages after this timestamp
+            max_count: Maximum messages to return
+
+        Returns:
+            List of messages
+        """
+        async with self._lock:
+            if channel not in self._buffers:
+                return []
+
+            now = time.time()
+            messages = []
+
+            for msg in self._buffers[channel]:
+                # Skip expired messages
+                msg_time = msg.get('timestamp', 0)
+                if now - msg_time > self._ttl_seconds:
+                    continue
+
+                # Skip messages before cutoff
+                if since_timestamp and msg_time <= since_timestamp:
+                    continue
+
+                messages.append(msg)
+
+                if len(messages) >= max_count:
+                    break
+
+            return messages
+
+    async def cleanup(self):
+        """Remove expired messages from all channels."""
+        async with self._lock:
+            now = time.time()
+            for channel, buffer in list(self._buffers.items()):
+                # Remove expired messages
+                while buffer and (now - buffer[0].get('timestamp', 0)) > self._ttl_seconds:
+                    buffer.popleft()
+
+                # Remove empty buffers
+                if not buffer:
+                    del self._buffers[channel]
+
+
+# Global message buffer instance
+_message_buffer = MessageBuffer(max_messages=100, ttl_seconds=300)
+
+
+async def get_message_buffer() -> MessageBuffer:
+    """Get global message buffer instance."""
+    return _message_buffer
+
+
 class RedisStreamManager:
     """Redis Streams manager for durable message delivery."""
-    
+
     def __init__(self, client: redis.Redis):
         """
         Initialize Redis Streams manager.
-        
+
         Args:
             client: Redis async client
         """

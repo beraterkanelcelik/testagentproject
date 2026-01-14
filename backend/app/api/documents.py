@@ -422,17 +422,28 @@ def document_file(request, document_id):
         )
         response['Content-Disposition'] = f'inline; filename="{document.title}"'
         # X-Frame-Options is exempted via decorator, so we can use CSP for better control
-        response['Content-Security-Policy'] = "frame-ancestors 'self' http://localhost:3000 http://127.0.0.1:3000"
-        
-        # Add CORS headers for iframe access
-        origin = request.META.get('HTTP_ORIGIN', '')
-        referer = request.META.get('HTTP_REFERER', '')
-        allowed_origins = ['http://localhost:3000', 'http://127.0.0.1:3000']
-        
-        # Set CORS headers if from allowed origin
-        if any(allowed in origin or allowed in referer for allowed in allowed_origins):
-            response['Access-Control-Allow-Origin'] = origin if origin else 'http://localhost:3000'
+        # In DEBUG mode, allow all origins for Twingate/remote access
+        if settings.DEBUG:
+            # Allow all origins in development (for Twingate/remote access)
+            response['Content-Security-Policy'] = "frame-ancestors *"
+            origin = request.META.get('HTTP_ORIGIN', '')
+            if origin:
+                response['Access-Control-Allow-Origin'] = origin
+            else:
+                # Fallback: allow any origin in DEBUG mode
+                response['Access-Control-Allow-Origin'] = '*'
             response['Access-Control-Allow-Credentials'] = 'true'
+        else:
+            # Production: restrict to specific origins
+            response['Content-Security-Policy'] = "frame-ancestors 'self' http://localhost:3000 http://127.0.0.1:3000"
+            origin = request.META.get('HTTP_ORIGIN', '')
+            referer = request.META.get('HTTP_REFERER', '')
+            allowed_origins = ['http://localhost:3000', 'http://127.0.0.1:3000']
+            
+            # Set CORS headers if from allowed origin
+            if any(allowed in origin or allowed in referer for allowed in allowed_origins):
+                response['Access-Control-Allow-Origin'] = origin if origin else 'http://localhost:3000'
+                response['Access-Control-Allow-Credentials'] = 'true'
         
         return response
     except Exception as e:

@@ -62,3 +62,6 @@ temporalio>=1.8.0
 
 # Redis for pub/sub streaming
 redis>=5.0.0
+
+# Metrics and monitoring
+prometheus-client>=0.19.0

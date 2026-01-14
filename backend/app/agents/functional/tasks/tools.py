@@ -53,7 +53,10 @@ def execute_tools(
         import time
         start_time = time.time()
         try:
-            result = tool_node.invoke({"messages": [ai_msg]}, config=config)
+            # ToolNode doesn't need config for basic execution
+            # Config is mainly for callbacks and checkpointing which aren't needed for tool execution
+            # Passing malformed config causes "Missing required config key" errors
+            result = tool_node.invoke({"messages": [ai_msg]})
             duration = time.time() - start_time
             
             # Record metrics for each tool
