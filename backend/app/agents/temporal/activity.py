@@ -163,8 +163,13 @@ async def run_chat_activity(input_data: Any) -> Dict[str, Any]:
         session_id = state.get("session_id", chat_id)
         
         logger.info(f"[ACTIVITY_START] Starting activity for chat_id={chat_id}, message_preview={message[:50] if message else '(empty)'}..., user_id={user_id}, session_id={session_id}")
-        
-        if not message:
+
+        # Check if this is a resume operation (has resume_payload)
+        resume_payload = state.get("resume_payload")
+        is_resume = resume_payload is not None
+
+        # Allow empty message for resume operations, but require it for initial runs
+        if not message and not is_resume:
             logger.error(f"[ACTIVITY_ERROR] No message in state for chat_id={chat_id}")
             return ChatActivityOutput(
                 status="error",

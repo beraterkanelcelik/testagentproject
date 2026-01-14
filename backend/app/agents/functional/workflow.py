@@ -456,6 +456,7 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                 # and interrupt() will return the resume payload (approval decisions)
                 # Use generic agent task (no hardcoded routing)
                 logger.info(f"[WORKFLOW] Routing to {routing.agent} agent for query_preview={routing.query[:50] if routing.query else '(empty)'}...")
+
                 response = execute_agent(
                     agent_name=routing.agent,
                     messages=messages,
@@ -612,6 +613,7 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
             all_tool_results = []
             if tools_to_execute:
                 logger.info(f"[WORKFLOW] Executing {len(tools_to_execute)} tools: auto={len(auto_tools)} manual={len(manual_tools)} approved={len([tc for tc in approval_tools if tc.get('status') == 'approved'])} session={current_session_id}")
+
                 # Include tool_call_id in tool_calls_to_execute for deterministic mapping
                 tool_calls_to_execute = [
                     {
@@ -621,14 +623,14 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                     }
                     for tc in tools_to_execute
                 ]
-                
+
                 # Get routing agent for tool execution
                 if 'routing' in locals() and routing:
                     tool_exec_agent = routing.agent
                 else:
                     # Fallback to agent_name from response
                     tool_exec_agent = response.agent_name if hasattr(response, 'agent_name') and response.agent_name else "greeter"
-                
+
                 tool_results = execute_tools(
                     tool_calls=tool_calls_to_execute,
                     agent_name=tool_exec_agent,
@@ -752,6 +754,7 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
                     last_human_msg = next((msg for msg in reversed(messages) if isinstance(msg, HumanMessage)), None)
                     refine_query = last_human_msg.content if last_human_msg else ""
                 logger.info(f"[WORKFLOW] Invoking agent_with_tool_results_task for agent={refine_agent} with {len(tool_results)} tool results, messages_count={len(messages)}")
+
                 refined_response = refine_with_tool_results(
                     agent_name=refine_agent,
                     messages=messages,
@@ -993,6 +996,19 @@ def extract_interrupt_value(interrupt_raw: Any) -> Dict[str, Any]:
     # Fallback: return raw data if we couldn't extract value
     logger.warning(f"[HITL] [INTERRUPT] Could not extract interrupt value, using raw data: {type(interrupt_raw)}")
     return interrupt_raw if isinstance(interrupt_raw, dict) else {}
+
+
+def get_event_queue_from_config(config: Dict[str, Any]):
+    """
+    Get event_queue from checkpoint config if available.
+    
+    Args:
+        config: Checkpoint configuration dict
+        
+    Returns:
+        Event queue if available, None otherwise
+    """
+    return config.get('_event_queue')
 
 
 def partition_tools(
@@ -1246,15 +1262,22 @@ async def ai_agent_workflow_events(request: Union[AgentRequest, Command], sessio
     
     # Status messages mapping
     # Note: Task names match @task function names for EventCallbackHandler
+    # Include both actual function names and backward compatibility aliases
     status_messages = {
-        "supervisor_task": "Routing to agent...",
+        # Actual function names (primary)
+        "route_to_agent": "Routing to agent...",
+        "execute_agent": "Processing with agent...",
+        "execute_tools": "Executing tools...",
+        "refine_with_tool_results": "Processing tool results...",
         "load_messages_task": "Loading conversation history...",
         "check_summarization_needed_task": "Checking if summarization needed...",
+        "save_message_task": "Saving message...",
+        # Backward compatibility aliases (fallback)
+        "supervisor_task": "Routing to agent...",
         "generic_agent_task": "Processing with agent...",
         "agent_task": "Processing with agent...",
         "tool_execution_task": "Executing tools...",
         "agent_with_tool_results_task": "Processing tool results...",
-        "save_message_task": "Saving message...",
     }
     
     # Create thread-safe queue for events from callbacks
@@ -1286,6 +1309,9 @@ async def ai_agent_workflow_events(request: Union[AgentRequest, Command], sessio
                 logger.debug(f"[LANGFUSE] Added CallbackHandler to workflow for trace_id={trace_id}")
         except Exception as e:
             logger.warning(f"Failed to add Langfuse CallbackHandler: {e}", exc_info=True)
+    
+    # Add event_queue to config so it can be accessed in ai_agent_workflow for status updates
+    checkpoint_config['_event_queue'] = event_queue
     
     # Track final response and interrupt - use list for thread-safe sharing
     final_response_holder = [None]

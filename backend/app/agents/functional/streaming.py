@@ -152,12 +152,29 @@ class EventCallbackHandler(BaseCallbackHandler):
             # Send status update if task identified
             if task_name and task_name in self.status_messages:
                 status = self.status_messages[task_name]
+                
+                # Extract agent name from inputs for agent-related tasks
+                agent_name = None
+                if task_name in ("execute_agent", "refine_with_tool_results", "agent_task", "generic_agent_task", "agent_with_tool_results_task"):
+                    # Try to get agent_name from inputs
+                    if isinstance(inputs, dict):
+                        agent_name = inputs.get("agent_name")
+                        if not agent_name and "agent" in inputs:
+                            # Sometimes it's nested
+                            agent_name = inputs.get("agent", {}).get("name") if isinstance(inputs.get("agent"), dict) else None
+                
+                # Customize status message with agent name if available
+                if agent_name and task_name in ("execute_agent", "agent_task", "generic_agent_task"):
+                    status = f"Processing with {agent_name} agent..."
+                elif agent_name and task_name in ("refine_with_tool_results", "agent_with_tool_results_task"):
+                    status = f"Processing tool results with {agent_name} agent..."
+                
                 if task_name not in self.active_tasks:
-                    self.active_tasks[task_name] = {"status": status}
+                    self.active_tasks[task_name] = {"status": status, "agent_name": agent_name}
                     try:
                         self.event_queue.put_nowait({
                             "type": "update",
-                            "data": {"status": status, "task": task_name}
+                            "data": {"status": status, "task": task_name, "agent_name": agent_name} if agent_name else {"status": status, "task": task_name}
                         })
                     except QueueFull:
                         logger.debug(f"Event queue full, dropping status update")
@@ -184,26 +201,51 @@ class EventCallbackHandler(BaseCallbackHandler):
                                 task_info = self.active_tasks[task_name]
                                 status_text = task_info.get("status", "")
                                 
-                                # Convert to past tense
-                                past_tense_map = {
-                                    "Processing with agent...": "Processed with agent",
-                                    "Routing to agent...": "Routed to agent",
-                                    "Loading conversation history...": "Loaded conversation history",
-                                    "Executing tools...": "Executed tools",
-                                    "Processing tool results...": "Processed tool results",
-                                    "Checking if summarization needed...": "Checked if summarization needed",
-                                    "Saving message...": "Saved message",
-                                }
-                                past_status = past_tense_map.get(status_text, status_text.replace("ing...", "ed").replace("ing", "ed"))
+                                # Extract agent name from outputs for routing task
+                                agent_name = task_info.get("agent_name")
+                                if not agent_name and task_name in ("route_to_agent", "supervisor_task"):
+                                    # Try to extract agent name from routing decision output
+                                    try:
+                                        if hasattr(outputs, 'agent'):
+                                            agent_name = outputs.agent
+                                        elif isinstance(outputs, dict) and 'agent' in outputs:
+                                            agent_name = outputs['agent']
+                                        elif hasattr(outputs, 'get') and callable(getattr(outputs, 'get')):
+                                            agent_name = outputs.get('agent')
+                                    except Exception:
+                                        pass
+                                
+                                # Convert to past tense, preserving agent/tool names
+                                if agent_name and "Processing with" in status_text and "agent" in status_text:
+                                    past_status = f"Processed with {agent_name} agent"
+                                elif agent_name and "Processing tool results" in status_text:
+                                    past_status = f"Processed tool results with {agent_name} agent"
+                                elif agent_name and "Routing to agent" in status_text:
+                                    past_status = f"Routed to {agent_name} agent"
+                                else:
+                                    # Generic past tense conversion
+                                    past_tense_map = {
+                                        "Processing with agent...": "Processed with agent",
+                                        "Routing to agent...": "Routed to agent",
+                                        "Loading conversation history...": "Loaded conversation history",
+                                        "Executing tools...": "Executed tools",
+                                        "Processing tool results...": "Processed tool results",
+                                        "Checking if summarization needed...": "Checked if summarization needed",
+                                        "Saving message...": "Saved message",
+                                    }
+                                    past_status = past_tense_map.get(status_text, status_text.replace("ing...", "ed").replace("ing", "ed"))
                                 
                                 try:
+                                    update_data = {
+                                        "status": past_status,
+                                        "task": task_name,
+                                        "is_completed": True
+                                    }
+                                    if agent_name:
+                                        update_data["agent_name"] = agent_name
                                     self.event_queue.put_nowait({
                                         "type": "update",
-                                        "data": {
-                                            "status": past_status,
-                                            "task": task_name,
-                                            "is_completed": True
-                                        }
+                                        "data": update_data
                                     })
                                 except QueueFull:
                                     logger.debug(f"Event queue full, dropping completion update")
