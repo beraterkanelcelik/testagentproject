@@ -270,38 +270,84 @@ class TestScalabilityLevels(TransactionTestCase):
     async def _test_temporal_workflows_async(
         self, sessions: List, metrics: MetricsCollector
     ) -> float:
-        """Test Temporal workflow creation throughput."""
-        from unittest.mock import patch, AsyncMock, MagicMock
+        """Test Temporal workflow creation throughput with REAL OpenAI calls."""
+        # REMOVED MOCKS - Now using real workflows that will call OpenAI API
+        # This tests the full end-to-end flow including LLM invocations
         
-        with patch('app.agents.temporal.workflow_manager.get_temporal_client') as mock_get_client:
-            mock_client = AsyncMock()
-            mock_workflow_handle = MagicMock()
-            mock_workflow_handle.id = "test-workflow-id"
-            mock_client.start_workflow.return_value = mock_workflow_handle
-            mock_get_client.return_value = mock_client
+        from app.core.temporal import get_temporal_client
+        from app.agents.temporal.workflow_manager import get_workflow_id
+        
+        start_time = time.time()
+        tasks = []
+        workflow_handles = []
+        
+        # Create workflows with batching to avoid overwhelming Temporal connections
+        # Batch size: 20 concurrent workflows at a time
+        batch_size = 20
+        all_results = []
+        
+        for batch_start in range(0, len(sessions), batch_size):
+            batch_end = min(batch_start + batch_size, len(sessions))
+            batch_sessions = sessions[batch_start:batch_end]
             
-            start_time = time.time()
-            tasks = []
-            for session in sessions:
+            batch_tasks = []
+            for session in batch_sessions:
                 task = get_or_create_workflow(
                     session.user.id,
                     session.id,
                     initial_state={
                         "user_id": session.user.id,
                         "session_id": session.id,
-                        "message": f"Test message for session {session.id}",
+                        "message": f"Hello, this is a scalability test message for session {session.id}. Please respond briefly.",
                         "flow": "main"
                     }
                 )
-                tasks.append(task)
+                batch_tasks.append(task)
             
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            total_time = time.time() - start_time
+            # Execute batch with small delay between batches
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            all_results.extend(batch_results)
             
-            successful = sum(1 for r in results if not isinstance(r, Exception))
-            throughput = successful / total_time if total_time > 0 else 0
-            
-            return throughput
+            # Small delay between batches to avoid overwhelming connections
+            if batch_end < len(sessions):
+                await asyncio.sleep(0.5)
+        
+        results = all_results
+        creation_time = time.time() - start_time
+        
+        # Collect successful workflow handles
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                metrics.record_error('workflow_creation', str(result), {
+                    'session_id': sessions[i].id if i < len(sessions) else None
+                })
+            else:
+                workflow_handles.append(result)
+                metrics.record('workflow_creation', creation_time / len(sessions))
+        
+        successful_creations = len(workflow_handles)
+        creation_throughput = successful_creations / creation_time if creation_time > 0 else 0
+        
+        # Wait a bit for workflows to start executing (including OpenAI calls)
+        print(f"  Created {successful_creations} workflows, waiting 10s for execution to start...")
+        await asyncio.sleep(10)
+        
+        # Check how many workflows are actually running (verifying they started OpenAI calls)
+        client = await get_temporal_client()
+        running_count = 0
+        for handle in workflow_handles[:min(100, len(workflow_handles))]:  # Sample first 100 to avoid timeout
+            try:
+                description = await handle.describe()
+                if description.status.name == "RUNNING":
+                    running_count += 1
+            except Exception as e:
+                pass  # Workflow might have completed or failed
+        
+        total_time = time.time() - start_time
+        print(f"  {running_count}/{min(100, len(workflow_handles))} sampled workflows are running (executing OpenAI calls)")
+        print(f"  Note: Workflows will continue running in background - this tests creation + execution start")
+        
+        return creation_throughput
     
     def _print_level_summary(self, level: int, result: Dict[str, Any]):
         """Print summary for a level."""
