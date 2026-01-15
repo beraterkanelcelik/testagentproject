@@ -5,6 +5,7 @@ import { create } from 'zustand'
 import type { StateCreator } from 'zustand'
 import { chatAPI } from '@/lib/api'
 import { getErrorMessage } from '@/lib/utils'
+import { isRealMessageId } from '@/constants/messages'
 
 export interface ChatSession {
   id: number
@@ -153,11 +154,7 @@ export const useChatStore = create<ChatState>((set: (partial: ChatState | Partia
       })
       // Filter out any temporary messages (those with negative IDs or very large IDs)
       // Real database IDs are positive and typically much smaller
-      const realMessages = mappedMessages.filter((msg: Message) => {
-        // Keep all messages with reasonable positive IDs (likely from DB)
-        // Temporary messages have negative IDs (for real-time streaming) or very large numbers
-        return msg.id > 0 && msg.id < 1000000000000
-      })
+      const realMessages = mappedMessages.filter((msg: Message) => isRealMessageId(msg.id))
       
       // Deduplicate messages by ID (in case backend returns duplicates)
       const seenIds = new Set<number>()

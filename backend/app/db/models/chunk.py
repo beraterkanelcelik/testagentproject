@@ -6,12 +6,8 @@ from django.db import models
 from django.conf import settings
 from .document import Document
 
-# Import pgvector VectorField
-try:
-    from pgvector.django import VectorField
-except ImportError:
-    # Fallback: will raise error if used without pgvector installed
-    VectorField = None
+# Import pgvector VectorField (required dependency)
+from pgvector.django import VectorField
 
 
 class DocumentChunk(models.Model):
@@ -58,7 +54,7 @@ class ChunkEmbedding(models.Model):
         on_delete=models.CASCADE,
         related_name='embedding'
     )
-    embedding = VectorField(dimensions=1536, null=True) if VectorField else models.TextField(null=True)
+    embedding = VectorField(dimensions=1536, null=True)
     embedding_model = models.CharField(max_length=100, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     
@@ -67,16 +63,6 @@ class ChunkEmbedding(models.Model):
         indexes = [
             models.Index(fields=['embedding_model'], name='chunk_embed_embeddi_88d9e0_idx'),
         ]
-        # HNSW index will be added via migration
-        # indexes = [
-        #     HnswIndex(
-        #         name='chunk_embedding_hnsw_idx',
-        #         fields=['embedding'],
-        #         m=16,
-        #         ef_construction=64,
-        #         opclasses=['vector_l2_ops']
-        #     )
-        # ]
     
     def __str__(self):
         return f"Embedding for {self.chunk} ({self.embedding_model})"

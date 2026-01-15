@@ -172,73 +172,39 @@ class AgentRunner:
         tokens_used = 0
         
         try:
-            # Execute with trace context if enabled
+            # Execute workflow
             # Pass session_id, user_id, trace_id separately to handle Command type
             # NOTE: Langfuse context is already managed inside ai_agent_workflow_events.run_workflow()
-            # We don't need to wrap it here again - doing so can cause context detach errors on interrupt
-            if LANGFUSE_ENABLED and self.trace_context:
-                # Just pass trace context - let ai_agent_workflow_events handle Langfuse context internally
-                async for event in ai_agent_workflow_events(
-                    self.request,
-                    session_id=self.chat_session_id,
-                    user_id=self.user_id,
-                    trace_id=self.trace_id
-                ):
-                    event_type = event.get("type", "unknown")
-                    
-                    # Accumulate tokens for done event
-                    if event_type == "token":
-                        accumulated_content += event.get("value", "")
-                    
-                    # Emit to callback if provided (for Temporal/Redis)
-                    if emit:
-                        emit(event)
-                    
-                    # Yield event
-                    yield event
-                    
-                    # Check for terminal events
-                    if event_type == "final":
-                        response = event.get("response")
-                        if response and hasattr(response, 'token_usage'):
-                            tokens_used = response.token_usage.get("total_tokens", 0)
-                        break
-                    elif event_type == "interrupt":
-                        # Interrupt is terminal - workflow paused for approval
-                        break
-                    elif event_type == "error":
-                        break
-            else:
-                async for event in ai_agent_workflow_events(
-                    self.request,
-                    session_id=self.chat_session_id,
-                    user_id=self.user_id,
-                    trace_id=self.trace_id
-                ):
-                    event_type = event.get("type", "unknown")
-                    
-                    # Accumulate tokens for done event
-                    if event_type == "token":
-                        accumulated_content += event.get("value", "")
-                    
-                    # Emit to callback if provided (for Temporal/Redis)
-                    if emit:
-                        emit(event)
-                    
-                    # Yield event
-                    yield event
-                    
-                    # Check for terminal events
-                    if event_type == "final":
-                        response = event.get("response")
-                        if response and hasattr(response, 'token_usage'):
-                            tokens_used = response.token_usage.get("total_tokens", 0)
-                        break
-                    elif event_type == "interrupt":
-                        # Interrupt is terminal - workflow paused for approval
-                        break
-                    elif event_type == "error":
-                        break
+            async for event in ai_agent_workflow_events(
+                self.request,
+                session_id=self.chat_session_id,
+                user_id=self.user_id,
+                trace_id=self.trace_id
+            ):
+                event_type = event.get("type", "unknown")
+
+                # Accumulate tokens for done event
+                if event_type == "token":
+                    accumulated_content += event.get("value", "")
+
+                # Emit to callback if provided (for Temporal/Redis)
+                if emit:
+                    emit(event)
+
+                # Yield event
+                yield event
+
+                # Check for terminal events
+                if event_type == "final":
+                    response = event.get("response")
+                    if response and hasattr(response, 'token_usage'):
+                        tokens_used = response.token_usage.get("total_tokens", 0)
+                    break
+                elif event_type == "interrupt":
+                    # Interrupt is terminal - workflow paused for approval
+                    break
+                elif event_type == "error":
+                    break
             
             # Flush traces if enabled
             if LANGFUSE_ENABLED:

@@ -105,9 +105,9 @@ def execute_agent(
         # Apply summarization middleware if needed (alternative to trimming)
         if needs_summarization:
             from app.agents.functional.middleware import create_agent_with_summarization
-            from app.agents.functional.workflow import get_checkpointer
-            
-            checkpointer = get_checkpointer()
+            from app.agents.functional.workflow import get_sync_checkpointer
+
+            checkpointer = get_sync_checkpointer()
             if checkpointer:
                 agent = create_agent_with_summarization(
                     agent=agent,

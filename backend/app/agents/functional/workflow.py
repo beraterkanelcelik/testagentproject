@@ -108,25 +108,6 @@ async def get_async_checkpointer() -> AsyncPostgresSaver:
     return _async_checkpointer
 
 
-# Backward compatibility alias
-def get_checkpointer() -> Optional[PostgresSaver]:
-    """
-    Get checkpointer instance (backward compatibility).
-    
-    Returns:
-        PostgresSaver instance or None on error
-    """
-    try:
-        return get_sync_checkpointer()
-    except Exception as e:
-        logger.error(f"Failed to get checkpointer: {e}", exc_info=True)
-        return None
-
-# Auto-executable tools per agent
-AUTO_EXECUTE_TOOLS = {
-    "search": ["rag_retrieval_tool"],
-    "greeter": ["rag_retrieval_tool"],
-}
 
 
 def extract_tool_proposals(tool_calls: List[Dict[str, Any]]) -> List[ToolProposal]:
@@ -246,23 +227,22 @@ def request_tool_approvals(tool_calls: List[Dict[str, Any]], session_id: int) ->
 def is_auto_executable(tool_name: str, agent_name: str) -> bool:
     """
     Check if a tool is auto-executable for the given agent.
-    
+
     Tools that require approval (human-in-the-loop) are not auto-executable.
-    
+
     Args:
         tool_name: Name of the tool
         agent_name: Name of the agent
-        
+
     Returns:
         True if tool is auto-executable, False if it requires approval
     """
     # Check if tool requires approval
     if tool_name in TOOLS_REQUIRING_APPROVAL:
         return False
-    
-    # Check auto-execute list
-    auto_tools = AUTO_EXECUTE_TOOLS.get(agent_name, [])
-    return tool_name in auto_tools
+
+    # No auto-executable tools by default - all tools execute manually or require approval
+    return False
 
 
 @entrypoint(checkpointer=get_sync_checkpointer())
@@ -347,7 +327,7 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
         # and skip re-invoking the agent if they exist
         
         # Get checkpointer instance first (needed for both paths)
-        checkpointer = get_checkpointer()
+        checkpointer = get_sync_checkpointer()
         
         # Extract session_id - from request or from resume payload
         if isinstance(request, Command):

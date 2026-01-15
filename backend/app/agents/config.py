@@ -17,7 +17,7 @@ LANGCHAIN_PROJECT = os.getenv('LANGCHAIN_PROJECT', 'agent-playground')
 LANGCHAIN_ENDPOINT = os.getenv('LANGCHAIN_ENDPOINT', 'https://api.smith.langchain.com')
 
 # Langfuse Configuration (primary tracing solution)
-from app.core.config import LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST, LANGFUSE_ENABLED
+from app.core.config import LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL, LANGFUSE_ENABLED
 
 # Checkpoint Configuration
 CHECKPOINT_TABLE_NAME = 'checkpoints'

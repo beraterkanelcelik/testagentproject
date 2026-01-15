@@ -2,7 +2,17 @@
   "permissions": {
     "allow": [
       "Bash(python -m py_compile:*)",
-      "Bash(python -c:*)"
+      "Bash(python -c:*)",
+      "Bash(find:*)",
+      "Bash(test:*)",
+      "Bash(python3:*)",
+      "Bash(docker-compose ps:*)",
+      "Bash(docker-compose:*)",
+      "Bash(docker logs:*)",
+      "Bash(curl:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker exec django-backend bash -c \"env | grep LANGFUSE\")",
+      "Bash(docker exec:*)"
     ]
   }
 }

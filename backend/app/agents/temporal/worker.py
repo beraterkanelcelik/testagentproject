@@ -17,7 +17,7 @@ from temporalio.client import Client
 from temporalio.service import RetryConfig, KeepAliveConfig
 from temporalio.worker import Worker
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
-from app.agents.temporal.workflow import ChatWorkflow, DocumentProcessingWorkflow
+from app.agents.temporal.workflow import ChatWorkflow
 from app.agents.temporal.activity import run_chat_activity
 from app.documents.temporal.workflow import DocumentQueueWorkflow
 from app.documents.temporal.activity import (
@@ -143,11 +143,10 @@ async def run_worker():
         )
         
         # Create chat worker (for chat workflows)
-        # Include DocumentProcessingWorkflow for backward compatibility with old executions
         chat_worker = Worker(
             client,
             task_queue=TEMPORAL_TASK_QUEUE,
-            workflows=[ChatWorkflow, DocumentProcessingWorkflow],
+            workflows=[ChatWorkflow],
             activities=[run_chat_activity],
             # Configure worker concurrency (reduced to save memory)
             max_concurrent_workflow_tasks=5,

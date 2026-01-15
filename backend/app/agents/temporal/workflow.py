@@ -15,32 +15,6 @@ from collections import deque
 from app.agents.temporal.activity import run_chat_activity
 
 
-@workflow.defn
-class DocumentProcessingWorkflow:
-    """
-    Legacy workflow class stub for backward compatibility.
-    
-    This workflow class no longer exists but old executions may still be in Temporal.
-    This stub immediately terminates to allow graceful cleanup of old workflows.
-    """
-    
-    @workflow.run
-    async def run(self, *args, **kwargs) -> Dict[str, Any]:
-        """
-        Terminate immediately - this is a legacy workflow that should not run.
-        
-        Accepts any arguments for backward compatibility with old workflow executions.
-        """
-        workflow.logger.warning(
-            f"[LEGACY_WORKFLOW] DocumentProcessingWorkflow is deprecated, terminating immediately. "
-            f"Workflow ID: {workflow.info().workflow_id}, Run ID: {workflow.info().run_id}"
-        )
-        return {
-            "status": "terminated",
-            "reason": "legacy_workflow_deprecated",
-            "workflow_id": workflow.info().workflow_id,
-        }
-
 # Read timeout from environment variable directly (cannot import from app.settings due to sandbox restrictions)
 # Workflows must be deterministic and cannot import Django settings which may have side effects
 TEMPORAL_APPROVAL_TIMEOUT_MINUTES = int(os.getenv('TEMPORAL_APPROVAL_TIMEOUT_MINUTES', '10'))
@@ -112,14 +86,13 @@ class ChatWorkflow:
             workflow.logger.warning("Workflow is closing, ignoring new message signal")
             return
         
-        # Generate deterministic hash for deduplication
-        # Use run_id if available (most stable), otherwise parent_message_id, otherwise content-based hash
+        # Generate stable message hash for deduplication
+        # Priority: run_id (most stable) > parent_message_id > content hash
         if run_id:
             message_hash = f"run:{run_id}"
         elif parent_message_id:
             message_hash = f"msg:{parent_message_id}"
         else:
-            # Content-based hash as fallback (for backward compatibility)
             import hashlib
             content = f"{message}:{plan_steps}:{flow}"
             message_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
@@ -195,286 +168,30 @@ class ChatWorkflow:
     
     @workflow.run
     async def run(
-        self, 
-        chat_id: int, 
+        self,
+        chat_id: int,
         initial_state: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Long-running workflow that processes messages via signals.
-        
+
         Args:
             chat_id: Chat session ID
             initial_state: Optional initial state (for signal_with_start)
                 Contains: user_id, tenant_id, org_slug, org_roles, app_roles
-            
+
         Returns:
             Dictionary with final status
         """
-        # Version check for workflow evolution
-        version_v2 = workflow.patched("v2-message-processing")
-        
-        if version_v2:
-            # New behavior with improved message processing
-            return await self._run_v2(chat_id, initial_state)
-        else:
-            # Old behavior (for running workflows)
-            return await self._run_v1(chat_id, initial_state)
-    
-    async def _run_v1(
-        self, 
-        chat_id: int, 
-        initial_state: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        V1 workflow implementation (original behavior for backward compatibility).
-        """
-        # CRITICAL: Use both logger and print for debugging - Temporal may suppress logger output
-        print(f"[WORKFLOW_START] Starting long-running chat workflow for session {chat_id}")
-        print(f"[WORKFLOW_START] Workflow ID: {workflow.info().workflow_id}, Run ID: {workflow.info().run_id}")
-        workflow.logger.info(f"[WORKFLOW_START] Starting long-running chat workflow for session {chat_id}")
-        workflow.logger.info(f"[WORKFLOW_START] Workflow ID: {workflow.info().workflow_id}, Run ID: {workflow.info().run_id}")
-        
-        # Store initial state for use in activities
-        self.initial_state = initial_state or {}
-        
-        # Log initial_state contents for debugging (especially user_id/tenant_id)
-        workflow.logger.debug(
-            f"[WORKFLOW_INIT] Stored initial_state for chat_id={chat_id}: "
-            f"user_id={self.initial_state.get('user_id')}, "
-            f"tenant_id={self.initial_state.get('tenant_id')}, "
-            f"keys={list(self.initial_state.keys())}"
-        )
-        
-        # Initialize last activity time
-        self.last_activity_time = workflow.now().timestamp()
-        
-        # Process initial message if provided (signal_with_start)
-        # Note: The signal will be received automatically via signal_with_start
-        # So we don't need to manually add it here
-        
-        # Inactivity timeout: 5 minutes
-        inactivity_timeout = timedelta(minutes=5)
-        
-        while not self.is_closing:
-            # Check for inactivity
-            if self.last_activity_time:
-                elapsed = timedelta(seconds=workflow.now().timestamp() - self.last_activity_time)
-                if elapsed >= inactivity_timeout:
-                    workflow.logger.info(f"Workflow inactive for {elapsed}, closing session {chat_id}")
-                    self.is_closing = True
-                    break
-            
-            # Process pending messages
-            if self.pending_messages:
-                signal_data = self.pending_messages.popleft()
-                message_content = signal_data.get("message", "")
-                
-                workflow.logger.info(f"[WORKFLOW_PROCESS] Processing message from queue: chat_id={chat_id}, message_preview={message_content[:50]}..., queue_remaining={len(self.pending_messages)}")
-                
-                # Prepare state for activity
-                # CRITICAL: Ensure user_id and tenant_id are always present for correct Redis channel
-                user_id = self.initial_state.get("user_id")
-                if not user_id:
-                    workflow.logger.error(f"[WORKFLOW_STATE] Missing user_id in initial_state for chat_id={chat_id}. initial_state_keys={list(self.initial_state.keys())}")
-                    # This should never happen if workflow_manager is correct, but log error for debugging
-                
-                # Ensure tenant_id is set - use user_id as fallback if tenant_id is missing
-                tenant_id = self.initial_state.get("tenant_id") or user_id
-                if not tenant_id:
-                    workflow.logger.error(f"[WORKFLOW_STATE] Missing both tenant_id and user_id in initial_state for chat_id={chat_id}")
-                
-                state = {
-                    "user_id": user_id,
-                    "session_id": chat_id,
-                    "message": message_content,
-                    "plan_steps": signal_data.get("plan_steps"),
-                    "flow": signal_data.get("flow", "main"),
-                    "run_id": signal_data.get("run_id"),  # Pass correlation ID to activity
-                    "parent_message_id": signal_data.get("parent_message_id"),  # Pass parent message ID to activity
-                    "tenant_id": tenant_id,  # Use user_id as fallback
-                    "org_slug": self.initial_state.get("org_slug"),
-                    "org_roles": self.initial_state.get("org_roles", []),
-                    "app_roles": self.initial_state.get("app_roles", []),
-                }
-                workflow.logger.info(f"[WORKFLOW_STATE] Prepared state for activity: chat_id={chat_id}, message_preview={message_content[:50]}..., user_id={user_id}, tenant_id={tenant_id}")
-                
-                # Execute activity for this message
-                try:
-                    activity_input = ChatActivityInput(chat_id=chat_id, state=state)
-                    
-                    workflow.logger.info(f"[WORKFLOW] Executing activity for message: chat_id={chat_id} message_preview={message_content[:50]}... session={chat_id}")
-                    print(f"[WORKFLOW] [BEFORE_ACTIVITY] About to call execute_activity, chat_id={chat_id}")
-                    workflow.logger.info(f"[WORKFLOW] [BEFORE_ACTIVITY] About to call execute_activity, chat_id={chat_id}")
-                    result = await workflow.execute_activity(
-                        run_chat_activity,
-                        activity_input,
-                        # Total time allowed from scheduling to completion (includes all retries)
-                        schedule_to_close_timeout=timedelta(minutes=30),  # Keep at 30 min for retries
-                        # Maximum time for a single attempt
-                        start_to_close_timeout=timedelta(minutes=TEMPORAL_ACTIVITY_TIMEOUT_MINUTES),
-                        # Heartbeat timeout - activity must heartbeat within this interval
-                        heartbeat_timeout=timedelta(seconds=60),  # Increased from 30s for slow LLM responses
-                        # Retry policy for transient failures
-                        retry_policy=RetryPolicy(
-                            maximum_attempts=3,
-                            initial_interval=timedelta(seconds=1),
-                            backoff_coefficient=2.0,
-                            maximum_interval=timedelta(seconds=30),
-                        ),
-                    )
-                    workflow.logger.info(f"[WORKFLOW] [AFTER_ACTIVITY] Activity returned, result type={type(result)}, chat_id={chat_id}")
-                    
-                    # Log activity result for debugging - CRITICAL: This must appear in worker logs
-                    workflow.logger.info(f"[WORKFLOW] [CRITICAL] Activity execution completed, processing result: type={type(result)} session={chat_id}")
-                    if isinstance(result, dict):
-                        result_status = result.get("status")
-                        result_keys = list(result.keys())
-                        workflow.logger.info(f"[WORKFLOW] Activity result received: status={result_status} keys={result_keys} session={chat_id}")
-                    else:
-                        result_status = None
-                        workflow.logger.warning(f"[WORKFLOW] Activity result is not a dict: type={type(result)} value={str(result)[:200]} session={chat_id}")
-                    
-                    # Check if activity was interrupted (human-in-the-loop)
-                    if result_status == "interrupted":
-                        print(f"[HITL] [WORKFLOW] Detected interrupted status - entering resume wait loop session={chat_id}")
-                        workflow.logger.info(f"[HITL] [WORKFLOW] Detected interrupted status - entering resume wait loop session={chat_id}")
-                        interrupt_data = result.get("interrupt")
-                        workflow.logger.info(f"[HITL] Activity returned interrupted: interrupt_data={interrupt_data} session={chat_id}")
-                        
-                        # Wait for resume signal with resume_payload
-                        try:
-                            print(f"[HITL] Entering wait_condition - workflow will pause until resume_payload is set session={chat_id}")
-                            workflow.logger.info(f"[HITL] Entering wait_condition - workflow will pause until resume_payload is set session={chat_id}")
-                            await workflow.wait_condition(
-                                lambda: self.resume_payload is not None,
-                                timeout=timedelta(minutes=TEMPORAL_APPROVAL_TIMEOUT_MINUTES)
-                            )
-                            print(f"[HITL] wait_condition returned - resume_payload is now set session={chat_id}")
-                            workflow.logger.info(f"[HITL] wait_condition returned - resume_payload is now set session={chat_id}")
-                            
-                            # Resume payload received, re-run activity with it
-                            resume_payload_to_use = self.resume_payload
-                            self.resume_payload = None  # Clear after use
-                            
-                            workflow.logger.info(f"[HITL] Resume received: resume_payload keys={list(resume_payload_to_use.keys()) if isinstance(resume_payload_to_use, dict) else 'N/A'} session={chat_id}")
-                            
-                            # Re-run activity with resume_payload
-                            state_with_resume = state.copy()
-                            state_with_resume["resume_payload"] = resume_payload_to_use
-                            
-                            # Re-run activity to continue execution with resume
-                            workflow.logger.info(f"[HITL] Re-running activity with resume_payload session={chat_id}")
-                            activity_input_continue = ChatActivityInput(chat_id=chat_id, state=state_with_resume)
-                            result = await workflow.execute_activity(
-                                run_chat_activity,
-                                activity_input_continue,
-                                schedule_to_close_timeout=timedelta(minutes=30),  # Keep at 30 min for retries
-                                start_to_close_timeout=timedelta(minutes=TEMPORAL_ACTIVITY_TIMEOUT_MINUTES),
-                                heartbeat_timeout=timedelta(seconds=60),  # Increased from 30s for slow LLM responses
-                                retry_policy=RetryPolicy(
-                                    maximum_attempts=3,
-                                    initial_interval=timedelta(seconds=1),
-                                    backoff_coefficient=2.0,
-                                    maximum_interval=timedelta(seconds=30),
-                                ),
-                            )
-                            workflow.logger.info(f"[HITL] Activity re-run completed after resume: status={result.get('status')} has_response={result.get('has_response')} session={chat_id}")
-                            workflow.logger.info(f"[HITL] Final response should be streaming to Redis channel chat:{tenant_id}:{chat_id} session={chat_id}")
-                                
-                        except TimeoutError:
-                            workflow.logger.warning(f"[HITL] Timeout waiting for resume: timeout=10min session={chat_id}")
-                            # Continue without resume - activity will handle gracefully
-                    else:
-                        print(f"[WORKFLOW] Activity did not return interrupted - status={result_status} - continuing normally session={chat_id}")
-                        workflow.logger.info(f"[WORKFLOW] Activity did not return interrupted - status={result_status} - continuing normally session={chat_id}")
-                    
-                    # Mark message as processed
-                    message_hash = signal_data.get('_hash')
-                    if message_hash:
-                        self.processed_messages.add(message_hash)
-                        
-                        # Cap processed_messages to prevent unbounded memory growth
-                        if len(self.processed_messages) > self.MAX_PROCESSED_MESSAGES:
-                            workflow.logger.warning(
-                                f"Clearing processed_messages set (size={len(self.processed_messages)}) "
-                                f"to prevent unbounded growth for session {chat_id}"
-                            )
-                            self.processed_messages.clear()
-                    
-                    # Store activity result for query
-                    self.last_activity_result = {
-                        "status": result.get("status") if isinstance(result, dict) else "unknown",
-                        "timestamp": workflow.now().timestamp(),
-                        "event_count": result.get("event_count", 0) if isinstance(result, dict) else 0,
-                        "has_response": result.get("has_response", False) if isinstance(result, dict) else False,
-                    }
-                    
-                    # Update last activity time after successful processing
-                    self.last_activity_time = workflow.now().timestamp()
-                    result_status_for_log = result.get('status') if isinstance(result, dict) else 'unknown'
-                    workflow.logger.info(f"[MESSAGE_PROCESS] Processed message session={chat_id} message_preview={signal_data.get('message', '')[:50]}... status={result_status_for_log} event_count={result.get('event_count', 'unknown') if isinstance(result, dict) else 'unknown'}")
-                    
-                except asyncio.CancelledError:
-                    # Workflow was cancelled during activity execution
-                    workflow.logger.info(f"Workflow cancelled during activity execution for session {chat_id}")
-                    self.is_closing = True
-                    raise  # Re-raise to allow Temporal to handle cancellation
-                except Exception as e:
-                    print(f"[WORKFLOW] [ERROR] Exception processing message for session {chat_id}: {e}")
-                    print(f"[WORKFLOW] [ERROR] Exception type: {type(e).__name__}")
-                    import traceback
-                    print(f"[WORKFLOW] [ERROR] Traceback: {traceback.format_exc()}")
-                    workflow.logger.error(f"Error processing message for session {chat_id}: {e}", exc_info=True)
-                    # Continue processing other messages even if one fails
-                    self.last_activity_time = workflow.now().timestamp()
-            
-            # Wait for new signals or timeout
-            # Use wait_condition to wait for either:
-            # 1. New message signal (adds to pending_messages)
-            # 2. Inactivity timeout (5 minutes)
-            
-            if not self.pending_messages:
-                # Wait for signal or timeout
-                try:
-                    # Wait up to inactivity timeout for a signal
-                    await workflow.wait_condition(
-                        lambda: len(self.pending_messages) > 0 or self.is_closing,
-                        timeout=inactivity_timeout
-                    )
-                except TimeoutError:
-                    # Inactivity timeout reached
-                    workflow.logger.info(f"Inactivity timeout reached for session {chat_id}")
-                    self.is_closing = True
-                    break
-                except asyncio.CancelledError:
-                    # Workflow was cancelled (e.g., session deleted)
-                    workflow.logger.info(f"Workflow cancelled for session {chat_id}")
-                    self.is_closing = True
-                    raise  # Re-raise to allow Temporal to handle cancellation
-            else:
-                # Small delay to allow batching of signals
-                try:
-                    await workflow.sleep(timedelta(milliseconds=100))
-                except asyncio.CancelledError:
-                    # Workflow was cancelled during sleep
-                    workflow.logger.info(f"Workflow cancelled during processing for session {chat_id}")
-                    self.is_closing = True
-                    raise  # Re-raise to allow Temporal to handle cancellation
-        
-        workflow.logger.info(f"Chat workflow closing for session {chat_id}")
-        return {
-            "status": "closed",
-            "chat_id": chat_id,
-            "reason": "inactivity_timeout" if self.is_closing else "normal"
-        }
-    
+        return await self._run_v2(chat_id, initial_state)
+
     async def _run_v2(
-        self, 
-        chat_id: int, 
+        self,
+        chat_id: int,
         initial_state: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        V2 workflow with improved message processing and better synchronization.
+        Workflow implementation with improved message processing and synchronization.
         """
         workflow.logger.info(f"[WORKFLOW_V2] Starting V2 workflow for session {chat_id}")
         

@@ -40,6 +40,7 @@ import { createAgentStream, StreamEvent } from '@/lib/streaming'
 import { chatAPI, agentAPI, documentAPI, modelsAPI } from '@/lib/api'
 import { getErrorMessage } from '@/lib/utils'
 import type { PlanProposalData } from '@/components/PlanProposal'
+import { generateTempMessageId, generateTempStatusMessageId } from '@/constants/messages'
 
 // Import extracted components
 import ChatSidebar from '@/components/chat/ChatSidebar'
@@ -104,10 +105,8 @@ export default function ChatPage() {
   const [selectedModel, setSelectedModel] = useState<string>('gpt-4o-mini')
   const [availableModels, setAvailableModels] = useState<Array<{id: string, name: string, description: string}>>([])
   
-  // Refs for streaming and file handling
-  const messagesEndRef = useRef<HTMLDivElement>(null) // Used for auto-scroll (handled by MessageList now)
-  const processedInterruptsRef = useRef<Set<string>>(new Set()) // Track processed interrupts to prevent duplicates
-  const fileInputRef = useRef<HTMLInputElement>(null) // File input ref (ChatInput manages its own, but kept for compatibility)
+  // Refs for streaming
+  const processedInterruptsRef = useRef<Set<string>>(new Set())
   const streamRef = useRef<ReturnType<typeof createAgentStream> | null>(null)
   const initialMessageSentRef = useRef(false)
   const initialMessageRef = useRef<string | null>(null)
@@ -248,7 +247,7 @@ export default function ChatPage() {
     setSending(true)
 
     // Add user message immediately
-    const tempUserMessageId = Date.now()
+    const tempUserMessageId = generateTempMessageId()
     const userMessage = {
       id: tempUserMessageId,
       role: 'user' as const,
@@ -530,9 +529,9 @@ export default function ChatPage() {
                   } else {
                     // Create new status message with unique temporary ID
                     // Use negative ID to avoid conflicts with database IDs
-                    const tempId = -(Date.now() + Math.random() * 1000)
+                    const tempId = generateTempStatusMessageId()
                     const newStatusMessage: Message = {
-                      id: tempId, // Temporary negative ID for real-time display
+                      id: tempId,
                       role: 'system',
                       content: updateData.status,
                       tokens_used: 0,
@@ -898,9 +897,6 @@ export default function ChatPage() {
     }
   }, [currentSession?.id, messages.length, sending, handleSendWithMessage])
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
 
 
   // ============================================================================
@@ -1085,10 +1081,6 @@ export default function ChatPage() {
       }
     }
 
-    // Reset file input
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ''
-    }
   }
 
   const handleRemoveFile = (index: number) => {
@@ -1107,13 +1099,6 @@ export default function ChatPage() {
     }
   }
 
-  // Handle file selection from plus menu
-  // Location: Triggered by ChatInput component's plus menu
-  // Note: ChatInput manages its own plus menu state and fileInputRef
-  const handleFileSelectionFromPlus = () => {
-    // ChatInput will handle closing its own menu and triggering file input
-    // This function is kept for compatibility but ChatInput manages everything internally
-  }
 
   // Handle plan approval
   const handlePlanApproval = useCallback(async (messageId: number, plan: PlanProposalData) => {

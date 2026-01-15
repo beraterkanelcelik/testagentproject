@@ -139,17 +139,6 @@ async def close_redis_for_current_loop() -> None:
             logger.warning(f"Error disconnecting Redis pool for loop {id(loop)}: {e}")
 
 
-# Legacy function name for backward compatibility (if needed elsewhere)
-async def close_redis_client(loop_id: Optional[int] = None) -> None:
-    """
-    Legacy function for closing Redis clients.
-    
-    Note: This function is deprecated. Use close_redis_for_current_loop() instead.
-    The loop_id parameter is ignored - this always closes the current loop's client.
-    """
-    if loop_id is not None:
-        logger.warning("close_redis_client(loop_id=...) is deprecated - use close_redis_for_current_loop() instead")
-    await close_redis_for_current_loop()
 
 
 class RobustRedisPubSub:
