@@ -9,7 +9,6 @@ from typing import List, Dict, Any, Optional
 from langgraph.func import task
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
-from app.agents.agents import get_agent
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -114,7 +113,7 @@ def analyze_and_plan(
         logger.info("[PLANNING] Starting plan analysis")
 
         # Get planning agent (uses Claude with structured output)
-        from app.agents.agents.factory import AgentFactory
+        from app.agents.factory import AgentFactory
         planning_agent = AgentFactory.create("planner", user_id=user_id)
 
         # Build planning messages with system prompt

@@ -541,7 +541,6 @@ def ai_agent_workflow(request: Union[AgentRequest, Command, Any]) -> AgentRespon
 
                         # Save plan proposal message BEFORE interrupt
                         if current_session_id:
-                            from app.agents.functional.tasks import save_message_task
                             save_message_task(
                                 response=AgentResponse(
                                     type="plan_proposal",
