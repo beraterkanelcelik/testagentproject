@@ -88,11 +88,3 @@ LANGFUSE_BASE_URL=http://localhost:3001
 ## License
 
 MIT
-
-```
-
-### Notes on the video
-- GitHub README rendering for `<video>` is **inconsistent** depending on where it’s viewed. If it doesn’t autoplay/show controls in some contexts, the most reliable fallback is:
-  - a GIF preview (`./assets/demo.gif`) + a link to the mp4 file.
-If you want, paste the path you plan to use and I’ll tailor the top section to the most GitHub-compatible version (video tag + fallback).
-```
