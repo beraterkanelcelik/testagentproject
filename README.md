@@ -4,6 +4,7 @@
 > Real-time streaming, full observability, intelligent routing, and RAG — end to end.
 
 <!-- ✅ Demo video (replace the path with your repo file path) -->
+[![Agent Playground Demo](./assets/demo.gif)](./assets/demo.mp4)
 <video src="./assets/demo.mp4" controls muted playsinline style="max-width: 100%; border-radius: 12px;"></video>
 
 ---
